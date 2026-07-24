@@ -55,11 +55,11 @@ void Hal::env_sensor_init()
 {
     mclog::tagInfo(_tag, "init");
 
-    auto i2c_bus = hal_bridge::board_get_i2c_bus();
+    auto i2c_bus = hal_bridge::board_get_port_a_i2c_bus();
 
     bme688_config_t cfg = {
         .i2c_bus = i2c_bus,
-        .dev_addr = BME688_I2C_ADDR_HIGH,
+        .dev_addr = BME688_I2C_ADDR_HIGH,  //HIGH uses 0x77 and LOW uses 0x76
     };
 
     static bme688_handle_t bme = nullptr;
