@@ -1,7 +1,19 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..3b6f07e 100644
+index d69d43d..291ca7f 100644
 --- a/main/application.cc
 +++ b/main/application.cc
+@@ -433,9 +433,9 @@ void Application::CheckNewVersion() {
+         retry_delay = 10; // Reset retry delay
+ 
+         if (ota_->HasNewVersion()) {
+-            if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
++           /*  if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return; // This line will never be reached after reboot
+-            }
++            } */
+             // If upgrade failed, continue to normal operation
+         }
+ 
 @@ -610,33 +610,36 @@ void Application::InitializeProtocol() {
  }
  
