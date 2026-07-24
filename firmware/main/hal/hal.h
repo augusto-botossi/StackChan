@@ -231,6 +231,17 @@ public:
     /* --------------------------------- HeadPet -------------------------------- */
     uitk::Signal<HeadPetGesture> onHeadPetGesture;
 
+    /* ------------------------------ Environment ------------------------------- */
+    struct EnvReading_t {
+        bool ok = false;
+        float temperatureC = 0.0f;
+        float humidityPct = 0.0f;
+        float pressureHpa = 0.0f;
+        uint32_t gasResistanceOhm = 0;
+    };
+    uitk::Signal<const EnvReading_t&> onEnvReading;
+    EnvReading_t getLastEnvReading();
+
     /* ----------------------------------- RGB ---------------------------------- */
     void setRgbColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
     void showRgbColor(uint8_t r, uint8_t g, uint8_t b);
@@ -310,6 +321,7 @@ private:
     void ble_init(bool useAltUuid);
     void servo_init();
     void head_touch_init();
+    void env_sensor_init();
     void io_expander_init();
     void imu_init();
     void rtc_init();

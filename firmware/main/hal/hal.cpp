@@ -39,6 +39,7 @@ void Hal::init()
     rtc_init();
     imu_init();
     servo_init();
+    env_sensor_init();
     lvgl_init();
 }
 
