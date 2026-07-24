@@ -32,20 +32,24 @@ bool Hal::updateFirmware(std::function<void(std::string_view)> onLog)
 
     const std::string &firmware_url     = ota.GetFirmwareUrl();
     const std::string &firmware_version = ota.GetFirmwareVersion();
-    if (firmware_url.empty()) {
+   /*  if (firmware_url.empty()) {
         mclog::tagError(_tag, "firmware update available but url is empty");
         onLog("Invalid firmware update info");
         return false;
-    }
+    } */
 
-    mclog::tagInfo(_tag, "new firmware available: version={}, url={}", firmware_version, firmware_url);
+    /* mclog::tagInfo(_tag, "new firmware available: version={}, url={}", firmware_version, firmware_url);
     if (!firmware_version.empty()) {
         onLog(std::string("New firmware found: ") + firmware_version);
     } else {
         onLog("New firmware found");
-    }
+    } */
 
-    onLog("Starting firmware upgrade...");
+    mclog::tagInfo(_tag, "new firmware available: version={}, url={} (auto-update disabled)", firmware_version, firmware_url);
+    onLog("New firmware available (auto-update disabled)");
+    return true;   // <-- pretend "up to date" rather than proceeding to Ota::Upgrade()
+
+    /* onLog("Starting firmware upgrade...");
     int last_reported_progress = -1;
     bool upgrade_success       = Ota::Upgrade(firmware_url, [&](int progress, size_t speed) {
         if (progress == last_reported_progress) {
@@ -72,5 +76,5 @@ bool Hal::updateFirmware(std::function<void(std::string_view)> onLog)
     onLog("Upgrade successful, rebooting...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     reboot();
-    return true;
+    return true; */
 }
