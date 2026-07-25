@@ -69,22 +69,9 @@ void Hal::xiaozhi_mcp_init()
                            return true;
                        });
     
-    mclog::tagInfo(_tag, "add sensors.get_environment tool");
-    mcp_server.AddTool("self.sensors.get_environment",
-                        "Returns current temperature (Celsius), humidity (%), pressure (hPa), and raw gas resistance "
-                        "(Ohms, uncalibrated) from the onboard environmental sensor.",
-                        std::vector<Property>{}, [this](const PropertyList& properties) -> ReturnValue {
-                            auto reading = GetHAL().getLastEnvReading();
-                            if (!reading.ok) {
-                                return std::string(R"({"available": false})");
-                            }
-                            auto result = fmt::format(
-                                R"({{"available": true, "temperature_c": {:.1f}, "humidity_pct": {:.1f}, )"
-                                R"("pressure_hpa": {:.1f}, "gas_resistance_ohm": {}}})",
-                                reading.temperatureC, reading.humidityPct, reading.pressureHpa, reading.gasResistanceOhm);
-                            mclog::tagInfo(_tag, "get_environment: {}", result);
-                            return result;
-                        });
+    if (GetHAL().getEnvSensor()) {
+    GetHAL().getEnvSensor()->registerMcpTools(mcp_server);
+    }
 
     mclog::tagInfo(_tag, "add robot.set_led_color tool");
     mcp_server.AddTool(

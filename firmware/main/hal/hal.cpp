@@ -7,6 +7,7 @@
 #include <memory>
 #include <mooncake_log.h>
 #include <nvs_flash.h>
+#include "board/hal_bridge.h"
 
 static std::unique_ptr<Hal> _hal_instance;
 static const std::string_view _tag = "HAL";
@@ -33,13 +34,13 @@ void Hal::init()
     ESP_ERROR_CHECK(ret);
 
     xiaozhi_board_init();
+    env_sensor_ = std::make_unique<EnvSensorModule>(hal_bridge::board_get_port_a_i2c_bus());
     xiaozhi_mcp_init();
     head_touch_init();
     io_expander_init();
     rtc_init();
     imu_init();
     servo_init();
-    env_sensor_init();
     lvgl_init();
 }
 

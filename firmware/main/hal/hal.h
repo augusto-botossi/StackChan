@@ -15,6 +15,7 @@
 #include <array>
 #include <lvgl_image.h>
 #include <string_view>
+#include "env_sensor_module.h"
 
 /**
  * @brief
@@ -231,17 +232,6 @@ public:
     /* --------------------------------- HeadPet -------------------------------- */
     uitk::Signal<HeadPetGesture> onHeadPetGesture;
 
-    /* ------------------------------ Environment ------------------------------- */
-    struct EnvReading_t {
-        bool ok = false;
-        float temperatureC = 0.0f;
-        float humidityPct = 0.0f;
-        float pressureHpa = 0.0f;
-        uint32_t gasResistanceOhm = 0;
-    };
-    uitk::Signal<const EnvReading_t&> onEnvReading;
-    EnvReading_t getLastEnvReading();
-
     /* ----------------------------------- RGB ---------------------------------- */
     void setRgbColor(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
     void showRgbColor(uint8_t r, uint8_t g, uint8_t b);
@@ -312,6 +302,10 @@ public:
     void getMicWaveformFrame(std::vector<int16_t>& data);
     void clearupMicTest();
 
+     EnvSensorModule* getEnvSensor() { 
+    return env_sensor_.get();
+    }
+
 private:
     bool _xiaozhi_start_requested = false;
 
@@ -321,10 +315,11 @@ private:
     void ble_init(bool useAltUuid);
     void servo_init();
     void head_touch_init();
-    void env_sensor_init();
     void io_expander_init();
     void imu_init();
     void rtc_init();
+
+    std::unique_ptr<EnvSensorModule> env_sensor_;
 };
 
 Hal& GetHAL();
