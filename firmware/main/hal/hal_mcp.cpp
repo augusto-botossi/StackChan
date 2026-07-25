@@ -73,6 +73,10 @@ void Hal::xiaozhi_mcp_init()
     GetHAL().getEnvSensor()->registerMcpTools(mcp_server);
     }
 
+    if (GetHAL().getGps()) {
+    GetHAL().getGps()->registerMcpTools(mcp_server);
+    }
+
     mclog::tagInfo(_tag, "add robot.set_led_color tool");
     mcp_server.AddTool(
         "self.robot.set_led_color",

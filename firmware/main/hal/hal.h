@@ -16,6 +16,7 @@
 #include <lvgl_image.h>
 #include <string_view>
 #include "env_sensor_module.h"
+#include "gps_module.h"
 
 /**
  * @brief
@@ -302,8 +303,12 @@ public:
     void getMicWaveformFrame(std::vector<int16_t>& data);
     void clearupMicTest();
 
-     EnvSensorModule* getEnvSensor() { 
+    EnvSensorModule* getEnvSensor() { 
     return env_sensor_.get();
+    }
+
+    GpsModule* getGps() {
+        return gps_.get();
     }
 
 private:
@@ -320,6 +325,7 @@ private:
     void rtc_init();
 
     std::unique_ptr<EnvSensorModule> env_sensor_;
+    std::unique_ptr<GpsModule> gps_;
 };
 
 Hal& GetHAL();
