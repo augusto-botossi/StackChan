@@ -318,6 +318,8 @@ idf_component_register(SRCS ${SOURCES}
                         smooth_ui_toolkit
                     )
 
+target_link_libraries(${COMPONENT_LIB} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/hal/drivers/BSEC/lib/libalgobsec.a")
+
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)

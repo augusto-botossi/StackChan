@@ -1,8 +1,3 @@
-/*
- * SPDX-FileCopyrightText: 2026 M5Stack Technology CO LTD
- *
- * SPDX-License-Identifier: MIT
- */
 #pragma once
 #include <driver/i2c_master.h>
 #include <mutex>
@@ -16,6 +11,9 @@ public:
         float humidityPct = 0.0f;
         float pressureHpa = 0.0f;
         uint32_t gasResistanceOhm = 0;
+        float iaq = 0.0f;
+        uint8_t iaqAccuracy = 0;       // 0=stabilizing, 1=low, 2=medium, 3=high
+        float co2EquivalentPpm = 0.0f;
     };
 
     struct Impl;
@@ -27,5 +25,5 @@ public:
     void registerMcpTools(McpServer& mcp_server);
 
 private:
-    Impl* _impl;  // pimpl: keeps bme68x/BME688 types entirely out of this header
+    Impl* _impl;
 };

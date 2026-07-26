@@ -65,3 +65,5 @@ sdkconfig
 sdkconfig.old
 
 xiaozhi-esp32/
+
+main/hal/drivers/BSEC/
