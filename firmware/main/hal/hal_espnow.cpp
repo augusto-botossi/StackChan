@@ -157,7 +157,12 @@ bool Hal::espNowSend(const std::vector<uint8_t>& data, const uint8_t* destAddr)
 
 void Hal::setLaserEnabled(bool enabled)
 {
-    static bool laser_enabled = false;
+    // Laser accessory not used on this unit — GPIO2 is reserved for ENV Pro's Port A I2C bus.
+    // Intentionally left as a no-op to avoid conflicting with the sensor.
+    // If this accessory is added later, find a genuinely free GPIO for it rather than
+    // re-enabling this GPIO2 logic, since I2C mode isn't restored once this reconfigures the pin.
+    
+    /* static bool laser_enabled = false;
     static bool is_inited     = false;
 
     if (laser_enabled == enabled) {
@@ -180,5 +185,5 @@ void Hal::setLaserEnabled(bool enabled)
     } else {
         gpio_set_level(laser_pin, 0);
     }
-    laser_enabled = enabled;
+    laser_enabled = enabled; */
 }

@@ -1,56 +1,56 @@
-# Prerequisites
+# Prerequisites & Compiled Output
 *.d
-
-# Compiled Object files
 *.slo
 *.lo
 *.o
 *.obj
-
-# Precompiled Headers
 *.gch
 *.pch
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
 *.mod
 *.smod
-
-# Compiled Static libraries
 *.lai
 *.la
 *.a
 *.lib
-
-# Executables
 *.exe
 *.out
 *.app
 
-# MacOS desktop metadata files
-.DS_Store
+# Proprietary Hardware Drivers & Secrets
+main/hal/drivers/BSEC/
+components/*_private/
+*.secret.h
+*.secret.c
+*.key
+*.pem
 
-# Build files
+# ESP-IDF / Build Artifacts
 build/
 cmake-build-*/
-/components/
 managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+dependencies.lock
 
-# PlatformIO
-.pio/
-
-# VSCode
+# IDEs & Workspaces
 .vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
 .cache/
+.pio/
+*.code-workspace
 
-# Python virtual environment
+# OS & System Metadata
+.DS_Store
+Thumbs.db
+
+# Other Repos / Local Envs
 .venv/
-
-# Debug / Release files
+xiaozhi-esp32/
 Debug/
 debug/
 Release/
@@ -58,12 +58,3 @@ release/
 out/
 bin/
 obj/
-
-*.code-workspace
-
-sdkconfig
-sdkconfig.old
-
-xiaozhi-esp32/
-
-main/hal/drivers/BSEC/
