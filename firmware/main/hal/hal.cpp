@@ -35,7 +35,8 @@ void Hal::init()
 
     xiaozhi_board_init();
     env_sensor_ = std::make_unique<EnvSensorModule>(hal_bridge::board_get_port_a_i2c_bus());
-    gps_ = std::make_unique<GpsModule>(UART_NUM_2, 115200, 17, 18);
+    // Working gps_ = std::make_unique<GpsModule>(UART_NUM_2, 115200, 17, 18);
+    gps_ = std::make_unique<GpsModule>(UART_NUM_2, 115200, 9, 8); //Replaced to test conflict when Module LLM K144 is installed - Working.
     xiaozhi_mcp_init();
     head_touch_init();
     io_expander_init();

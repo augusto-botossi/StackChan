@@ -72,7 +72,7 @@ static void _update_task(void* param)
         for (int i = 0; i < len; i++) {
             char c = (char)buf[i];
             if (c == '\n') {
-                // mclog::tagInfo(_tag, "NMEA: {}", impl->line_buffer);   // <-- add this temporarily
+                //mclog::tagInfo(_tag, "NMEA: {}", impl->line_buffer);   // <-- add this temporarily to log GPS coordinates to console for testing
                 GpsModule::Fix fix;
                 {
                     std::lock_guard<std::mutex> lock(impl->mutex);
