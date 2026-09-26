@@ -99,6 +99,30 @@ void disply_lvgl_unlock()
     display->LvglUnlock();
 }
 
+void set_display_status(const char* status)
+{
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->SetStatus(status);
+}
+
+void ensure_avatar_created()
+{
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->SetupUI();
+}
+
+void set_chat_message(const char* role, const char* content)
+{
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->SetChatMessage(role, content);
+}
+
+void clear_chat_messages()
+{
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->ClearChatMessages();
+}
+
 /* -------------------------------------------------------------------------- */
 /*                                 Application                                */
 /* -------------------------------------------------------------------------- */
@@ -149,6 +173,13 @@ void app_play_sound(const std::string_view& sound)
 {
     auto& app = Application::GetInstance();
     app.PlaySound(sound);
+}
+
+// Restore the idle motion modifier to use Avatar's idle motion on the Offline Assistant App
+void restore_idle_motion()
+{
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->RestoreIdleMotion();
 }
 
 }  // namespace hal_bridge

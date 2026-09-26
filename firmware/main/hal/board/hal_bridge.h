@@ -65,4 +65,11 @@ uint8_t board_get_speaker_volume();
 
 void app_play_sound(const std::string_view& sound);
 
+void set_display_status(const char* status); // To use the Avatar interaction from the factory firmware code
+void ensure_avatar_created(); // To use the Avatar interaction from the factory firmware code
+void set_xiaozhi_idle(bool idle); // Added to elimitanate the animation throttle when on the Offline Assistant App
+void set_chat_message(const char* role, const char* content); // To use the Avatar interaction (caption text) from the factory firmware code
+void clear_chat_messages(); // To use the Avatar interaction (caption text) from the factory firmware code
+void restore_idle_motion(); // Restore the idle motion modifier to use Avatar's idle motion on the Offline Assistant App
+
 }  // namespace hal_bridge

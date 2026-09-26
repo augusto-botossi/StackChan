@@ -17,6 +17,7 @@
 #include <string_view>
 #include "env_sensor_module.h"
 #include "gps_module.h"
+#include "offline_agent_module.h"
 
 /**
  * @brief
@@ -217,6 +218,23 @@ public:
     XiaozhiConfig_t getXiaozhiConfig();
     void setXiaozhiConfig(XiaozhiConfig_t config);
 
+    /* ----------------------------- Offline Agent ------------------------------ */
+    void requestOfflineAgentStart()
+    {
+        _offline_agent_start_requested = true;
+    }
+    bool isOfflineAgentStartRequested()
+    {
+        return _offline_agent_start_requested;
+    }
+    void startOfflineAgent();
+    void updateOfflineAgent()
+    {
+        if (offline_agent_) {
+            offline_agent_->update();
+        }
+    }
+
     /* ----------------------------------- BLE ---------------------------------- */
     uitk::Signal<const char*> onBleMotionData;
     uitk::Signal<const char*> onBleAvatarData;
@@ -313,7 +331,8 @@ public:
 
 private:
     bool _xiaozhi_start_requested = false;
-
+    bool _offline_agent_start_requested = false;
+    
     void xiaozhi_board_init();
     void lvgl_init();
     void xiaozhi_mcp_init();
@@ -323,9 +342,12 @@ private:
     void io_expander_init();
     void imu_init();
     void rtc_init();
+    void registerOfflineAgentCallbacks(OfflineAgentModule* agent);
+    void constructAndStartOfflineAgent();
 
     std::unique_ptr<EnvSensorModule> env_sensor_;
     std::unique_ptr<GpsModule> gps_;
+    std::unique_ptr<OfflineAgentModule> offline_agent_;
 };
 
 Hal& GetHAL();
@@ -345,3 +367,5 @@ public:
         GetHAL().lvglUnlock();
     }
 };
+
+void _stackchan_update_task(void* param);

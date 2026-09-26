@@ -49,7 +49,9 @@ public:
     virtual void SetStatus(const char* status) override;
     virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
 
-    void LvglLock();
+    void LvglLock(); 
     void LvglUnlock();
     lv_disp_t* GetLvglDisplay();
+
+    void RestoreIdleMotion(); // Restore the idle motion modifier to use Avatar's idle motion on the Offline Assistant App
 };

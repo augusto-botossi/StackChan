@@ -28,11 +28,18 @@ extern "C" void app_main(void)
 
     const bool skip_mooncake =
         GetHAL().getXiaozhiConfig().startAiAgentOnBoot && GetHAL().getWarmRebootTarget() < 0;
+    // NOTE: deliberately no equivalent "start offline agent on boot"
+    // skip - offline mode is always chosen explicitly through the
+    // launcher, never auto-started. Module LLM boots independently of
+    // CoreS3 regardless of this flag, so an auto-boot skip here
+    // wouldn't solve anything Module LLM-related, it would just remove
+    // the ability to choose cloud vs. offline each session.
 
     if (!skip_mooncake) {
         // Install apps
         GetMooncake().installApp(std::make_unique<AppLauncher>());
         GetMooncake().installApp(std::make_unique<AppAiAgent>());
+        GetMooncake().installApp(std::make_unique<AppOfflineAgent>());
         GetMooncake().installApp(std::make_unique<AppAvatar>());
         GetMooncake().installApp(std::make_unique<AppEspnowControl>());
         GetMooncake().installApp(std::make_unique<AppAppCenter>());
@@ -47,7 +54,7 @@ extern "C" void app_main(void)
 
             GetMooncake().update();
 
-            if (GetHAL().isXiaozhiStartRequested()) {
+            if (GetHAL().isXiaozhiStartRequested() || GetHAL().isOfflineAgentStartRequested()) {
                 break;
             }
         }
@@ -57,6 +64,15 @@ extern "C" void app_main(void)
         DestroyMooncake();
     }
 
-    // Start xiaozhi, never returns
-    GetHAL().startXiaozhi();
+    // Exactly one of these fires - whichever flag caused the loop above
+    // to break (or, if skip_mooncake was true, isOfflineAgentStartRequested()
+    // is guaranteed false since that path never installed/opened any
+    // app, so this correctly falls through to Xiaozhi as before).
+    if (GetHAL().isOfflineAgentStartRequested()) {
+        // Start offline agent, never returns
+        GetHAL().startOfflineAgent();
+    } else {
+        // Start xiaozhi, never returns
+        GetHAL().startXiaozhi();
+    }
 }

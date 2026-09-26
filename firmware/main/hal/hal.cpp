@@ -146,7 +146,7 @@ void Hal::xiaozhi_board_init()
     hal_bridge::xiaozhi_board_init();
 }
 
-static void _stackchan_update_task(void* param)
+void _stackchan_update_task(void* param)
 {
     bool is_setup_done = false;
 

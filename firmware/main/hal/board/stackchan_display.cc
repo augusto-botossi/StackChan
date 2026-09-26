@@ -477,6 +477,12 @@ bool hal_bridge::is_xiaozhi_idle()
     return _is_xiaozhi_idle;
 }
 
+// Added to elimitanate the animation throttle when on the Offline Assistant App
+void hal_bridge::set_xiaozhi_idle(bool idle)
+{
+    _is_xiaozhi_idle = idle;
+}
+
 void StackChanAvatarDisplay::SetStatus(const char* status)
 {
     // ESP_LOGE(TAG, "SetStatus: %s", status);
@@ -570,4 +576,21 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
 
 void StackChanAvatarDisplay::ShowNotification(const char* notification, int duration_ms)
 {
+}
+
+
+// Restore the idle motion modifier to use Avatar's idle motion on the Offline Assistant App
+void StackChanAvatarDisplay::RestoreIdleMotion()
+{
+    auto& stackchan = GetStackChan();
+    if (!stackchan.hasAvatar()) {
+        return;
+    }
+    DisplayLockGuard lock(this);
+    if (idle_motion_modifier_id_ < 0) {
+        if (idle_motion_level_ > 0) {
+            CreateIdleMotionModifier();
+        }
+        idle_expression_modifier_id_ = stackchan.addModifier(std::make_unique<IdleExpressionModifier>());
+    }
 }
