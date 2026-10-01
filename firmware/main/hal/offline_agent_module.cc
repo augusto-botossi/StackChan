@@ -6,8 +6,6 @@
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <system_info.h>
-#include <cctype>
-#include <algorithm>
 #include <utility>
 
 #include <freertos/FreeRTOS.h>
@@ -111,6 +109,15 @@ void OfflineAgentModule::setState(State newState)
 // Low-level send/receive helpers
 // ---------------------------------------------------------------------
 
+// Shared between setupLlm() (sent as the actual "prompt" field) and the
+// context-window reset logic (its own length is the post-reset
+// baseline for _conversation_char_estimate) - kept as one definition so
+// they can never silently drift apart.
+static const std::string kSystemPrompt =
+    "You are Becky, a friendly offline voice assistant. "
+    "Avoid contractions in your responses - write \"do not\" "
+    "instead of \"don't\", \"I am\" instead of \"I'm\", and so on.";
+
 static std::string new_request_id()
 {
     // Simple enough for our purposes - StackFlow only seems to echo
@@ -158,122 +165,15 @@ void OfflineAgentModule::sendLlmInference(const std::string& text)
     mclog::tagInfo(_tag, "-> llm inference: {}", text);
 }
 
-// Workaround for an apparent bug in MeloTTS's own text normalization:
-// contractions like "I'm" are spoken as "I delta am" - the literal
-// field name we send the text under ("delta") appears to leak into
-// speech during MeloTTS's own contraction-expansion step, which is
-// inside M5Stack's closed binary and not something we can fix directly.
-// Expanding common contractions ourselves before sending avoids
-// triggering whatever's broken in its internal handling. Not
-// exhaustive - covers the contractions most likely to appear in a
-// casual assistant response; add more here if new ones are spotted.
-static std::string expand_contractions(const std::string& text)
-{
-    static const std::vector<std::pair<std::string, std::string>> kContractions = {
-        {"I'm", "I am"}, {"I've", "I have"}, {"I'll", "I will"}, {"I'd", "I would"},
-        {"you're", "you are"}, {"you've", "you have"}, {"you'll", "you will"}, {"you'd", "you would"},
-        {"we're", "we are"}, {"we've", "we have"}, {"we'll", "we will"}, {"we'd", "we would"},
-        {"they're", "they are"}, {"they've", "they have"}, {"they'll", "they will"}, {"they'd", "they would"},
-        {"he's", "he is"}, {"he'll", "he will"}, {"he'd", "he would"},
-        {"she's", "she is"}, {"she'll", "she will"}, {"she'd", "she would"},
-        {"it's", "it is"}, {"it'll", "it will"},
-        {"that's", "that is"}, {"that'll", "that will"},
-        {"what's", "what is"}, {"who's", "who is"}, {"here's", "here is"}, {"there's", "there is"},
-        {"let's", "let us"},
-        {"don't", "do not"}, {"doesn't", "does not"}, {"didn't", "did not"},
-        {"can't", "cannot"}, {"couldn't", "could not"},
-        {"won't", "will not"}, {"wouldn't", "would not"},
-        {"isn't", "is not"}, {"aren't", "are not"}, {"wasn't", "was not"}, {"weren't", "were not"},
-        {"shouldn't", "should not"}, {"haven't", "have not"}, {"hasn't", "has not"}, {"hadn't", "had not"},
-    };
-
-    std::string result = text;
-    for (const auto& [contraction, expansion] : kContractions) {
-        // Match the contraction with either a lowercase or capitalized
-        // first letter (covers both mid-sentence and sentence-start
-        // occurrences, e.g. "I'm" vs "i'm" never happens but "It's" vs
-        // "it's" both do), leaving the rest of the word's case alone.
-        for (const std::string& variant : {contraction, std::string(1, toupper(contraction[0])) + contraction.substr(1)}) {
-            size_t pos = 0;
-            while ((pos = result.find(variant, pos)) != std::string::npos) {
-                std::string replacement = expansion;
-                if (isupper(variant[0])) {
-                    replacement[0] = toupper(replacement[0]);
-                }
-                result.replace(pos, variant.size(), replacement);
-                pos += replacement.size();
-            }
-        }
-    }
-    return result;
-}
-
-void OfflineAgentModule::sendMelottsInference(const std::string& text)
-{
-    std::string expanded = expand_contractions(text);
-
-    if (_speech_text_cb) {
-        _speech_text_cb(expanded);
-    }
-
-    // ~13 characters/second, based on real measured data (not just a
-    // guess): the 11.0 rate this replaced was found to systematically
-    // OVERSHOOT for longer responses, not undershoot - confirmed
-    // directly with a real 254-word/1491-character response, whose
-    // natural speaking time at ~150 wpm (a standard average pace) would
-    // be ~101.6s, but the 11.0 rate estimated 135.5s - roughly a third
-    // too long. During that whole extra ~34 seconds, Becky had already
-    // finished talking, but vad/whisper hadn't been triggered yet
-    // (state stays "Speaking" until this estimate elapses), so nothing
-    // was listening at all - a real, silent dead zone, not just
-    // wasted time. 13 chars/sec derives directly from 150 wpm x ~5.1
-    // average English characters per word / 60s. Still a heuristic,
-    // not a measured value for MeloTTS specifically, and still the
-    // sole mechanism for detecting speech completion (see
-    // setupMelotts() - enoutput:false means there is no real signal to
-    // fall back on) - further tuning may still be needed.
-    constexpr double kCharsPerSecond = 13.0;
-    // Digits take noticeably longer to speak than their character
-    // count alone suggests - a single digit like "9" is spoken as a
-    // whole word ("nine"), not a fraction of one, unlike typical
-    // prose where a handful of characters is often part of one short
-    // word. Confirmed directly: sensor-reading responses (containing
-    // decimals like "24.6", "37.4", "999.0") caused the follow-up
-    // window to open while Becky was still reading out the numbers,
-    // and the TAIL of her own speech got picked up as a garbled
-    // "hallucination" ("Zero head top that's your HAPE!", "999HP..")
-    // - actually an echo of her own voice, not anything really said,
-    // caused by the estimate undercounting specifically for
-    // digit-heavy text. Starting value (0.25s/digit), not precisely
-    // measured - may need further tuning.
-    constexpr double kExtraSecondsPerDigit = 0.25;
-    size_t digit_count = std::count_if(expanded.begin(), expanded.end(),
-        [](unsigned char c) { return std::isdigit(c); });
-    _speaking_started_ms = esp_timer_get_time() / 1000;
-    _estimated_speech_ms = static_cast<uint32_t>(
-        (expanded.size() / kCharsPerSecond) * 1000.0 + digit_count * kExtraSecondsPerDigit * 1000.0);
-
-    std::lock_guard<std::mutex> lock(_impl->tx_mutex);
-    // Sending "data" as a BARE STRING rather than {"delta": text} -
-    // even a request with ONLY the "delta" key (no index/finish) still
-    // produced "delta" spoken aloud, ruling out interference from
-    // those other fields. This suggests melotts's inference handler
-    // for this format doesn't expect an object at all, and some
-    // fallback/stringification path is leaking the literal key name
-    // "delta" into the synthesized text when it receives the wrong
-    // shape of payload.
-    ArduinoJson::JsonDocument doc;
-    doc["request_id"] = new_request_id();
-    doc["work_id"] = _melotts_work_id;
-    doc["action"] = "inference";
-    doc["object"] = "tts.utf-8";
-    doc["data"] = expanded;  // bare string, not an object
-    std::string body;
-    ArduinoJson::serializeJson(doc, body);
-    body += "\n";
-    uart_write_bytes(_impl->uart_num, body.data(), body.size());
-    mclog::tagInfo(_tag, "-> melotts inference: {}", expanded);
-}
+// NOTE: contractions like "I'm" being spoken as "I delta am" was a
+// real, confirmed MeloTTS text-normalization bug - previously worked
+// around here by expanding contractions in the text ourselves before
+// sending it to melotts. That workaround is no longer possible: melotts
+// is now chained directly to the LLM's own output (see setupMelotts()),
+// so its text never passes through our code again. The system prompt
+// in setupLlm() now asks the LLM itself to avoid contractions instead -
+// less reliable than direct text rewriting, but the only lever chaining
+// leaves us.
 
 void OfflineAgentModule::sendWorkAction(const std::string& work_id)
 {
@@ -296,6 +196,27 @@ void OfflineAgentModule::sendPauseAction(const std::string& work_id)
     std::string req = build_request(work_id, "pause", "");
     uart_write_bytes(_impl->uart_num, req.data(), req.size());
     mclog::tagInfo(_tag, "-> {} pause", work_id);
+}
+
+void OfflineAgentModule::sendLinkAction(const std::string& action, const std::string& work_id,
+                                        const std::string& target_work_id)
+{
+    // link/unlink's own "data" field is a bare string (the work_id to
+    // connect to/from), not an object - build_request()'s fill_data
+    // lambda always produces an object, so this constructs the request
+    // directly instead, matching README.md's own documented example.
+    std::lock_guard<std::mutex> lock(_impl->tx_mutex);
+    ArduinoJson::JsonDocument doc;
+    doc["request_id"] = new_request_id();
+    doc["work_id"] = work_id;
+    doc["action"] = action;
+    doc["object"] = "work_id";
+    doc["data"] = target_work_id;
+    std::string req;
+    ArduinoJson::serializeJson(doc, req);
+    req += "\n";
+    uart_write_bytes(_impl->uart_num, req.data(), req.size());
+    mclog::tagInfo(_tag, "-> {} {} {} {}", work_id, action, "work_id", target_work_id);
 }
 
 void OfflineAgentModule::startFollowUpWindow()
@@ -359,6 +280,7 @@ bool OfflineAgentModule::start(uint32_t readiness_timeout_ms)
     if (!setupLlm())      { mclog::tagError(_tag, "llm.setup failed"); return false; }
     if (!setupMelotts())  { mclog::tagError(_tag, "melotts.setup failed"); return false; }
 
+    _conversation_char_estimate = kSystemPrompt.size();
     setState(State::Idle);
     mclog::tagInfo(_tag, "Startup complete - idle, listening for wake word");
     return true;
@@ -388,6 +310,33 @@ bool OfflineAgentModule::waitForReady(uint32_t timeout_ms)
     return false;
 }
 
+// Reads lines until one whose own "work_id" field exactly matches
+// expected_work_id arrives, or the deadline passes - discarding
+// anything else along the way. Confirmed necessary as a real fix, not
+// just caution: without this, cleanupStaleTasks()'s own reads (below)
+// were the likely SOURCE of stale messages that went on to poison
+// later setup calls in do_setup() - e.g. a delayed exit acknowledgment
+// read here, but actually consumed one step too late, left the REAL
+// exit ack sitting in the buffer for some later, unrelated read to
+// misinterpret as its own response.
+static std::string read_matching_line(uart_port_t uart_num, std::string& rx_buffer,
+                                       uint32_t timeout_ms, const std::string& expected_work_id)
+{
+    uint32_t start_ms = esp_timer_get_time() / 1000;
+    while (true) {
+        uint32_t elapsed_ms = (esp_timer_get_time() / 1000) - start_ms;
+        if (elapsed_ms >= timeout_ms) return "";
+        std::string resp = read_line_blocking(uart_num, rx_buffer, timeout_ms - elapsed_ms);
+        if (resp.empty()) return "";
+
+        ArduinoJson::JsonDocument doc;
+        if (ArduinoJson::deserializeJson(doc, resp)) continue;
+        std::string candidate_work_id = doc["work_id"] | "";
+        if (candidate_work_id != expected_work_id) continue;
+        return resp;
+    }
+}
+
 void OfflineAgentModule::cleanupStaleTasks()
 {
     // Learned the hard way during the native pipeline tests: previous
@@ -405,7 +354,10 @@ void OfflineAgentModule::cleanupStaleTasks()
             request_line = build_request(unit, "taskinfo", "");
             uart_write_bytes(_impl->uart_num, request_line.data(), request_line.size());
         }
-        std::string resp = read_line_blocking(_impl->uart_num, _impl->rx_buffer, 5000);
+        // taskinfo's own response echoes the unit name (not a numbered
+        // work_id) as its "work_id" field - e.g. querying "kws" gets
+        // back a response with work_id "kws".
+        std::string resp = read_matching_line(_impl->uart_num, _impl->rx_buffer, 5000, unit);
         if (resp.empty()) continue;
 
         ArduinoJson::JsonDocument doc;
@@ -418,7 +370,10 @@ void OfflineAgentModule::cleanupStaleTasks()
             std::lock_guard<std::mutex> lock(_impl->tx_mutex);
             std::string exit_req = build_request(work_id, "exit", "");
             uart_write_bytes(_impl->uart_num, exit_req.data(), exit_req.size());
-            read_line_blocking(_impl->uart_num, _impl->rx_buffer, 5000);  // discard the exit ack
+            // exit's own response echoes back the exact work_id we sent
+            // it for - validate rather than blindly discarding "the
+            // next line", the same fix applied here as everywhere else.
+            read_matching_line(_impl->uart_num, _impl->rx_buffer, 5000, work_id);
         }
     }
 }
@@ -451,25 +406,54 @@ static bool do_setup(uart_port_t uart_num,
         uart_write_bytes(uart_num, req.data(), req.size());
     }
 
-    std::string resp = read_line_blocking(uart_num, rx_buffer, kSetupTimeoutMs);
-    if (resp.empty()) {
-        mclog::tagError(_tag, "{} setup: no response within {}ms", work_id, kSetupTimeoutMs);
-        return false;
-    }
+    // Validate each response actually belongs to THIS request before
+    // accepting it - confirmed directly as a real, serious bug without
+    // this check: every setup call reuses the same literal request_id
+    // ("setup"), so a stale message still sitting in the buffer (e.g. a
+    // delayed exit acknowledgment from cleanupStaleTasks() moments
+    // earlier) could get misread as an unrelated unit's setup response.
+    // Observed concretely: kws's setup response contained "llm.1003",
+    // llm's contained "kws.1004", melotts's contained "llm.1007" - the
+    // wake word was then never recognized at all (chime played, but
+    // _kws_work_id held the wrong value, so handleLine()'s matching
+    // logic never fired), despite kws itself working correctly.
+    // Loops past anything that doesn't start with the expected
+    // "<unit>." prefix, respecting the overall timeout budget across
+    // however many stale lines need skipping.
+    std::string expected_prefix = work_id + ".";
+    uint32_t start_ms = esp_timer_get_time() / 1000;
+    while (true) {
+        uint32_t elapsed_ms = (esp_timer_get_time() / 1000) - start_ms;
+        if (elapsed_ms >= kSetupTimeoutMs) {
+            mclog::tagError(_tag, "{} setup: no matching response within {}ms", work_id, kSetupTimeoutMs);
+            return false;
+        }
+        std::string resp = read_line_blocking(uart_num, rx_buffer, kSetupTimeoutMs - elapsed_ms);
+        if (resp.empty()) {
+            mclog::tagError(_tag, "{} setup: no response within {}ms", work_id, kSetupTimeoutMs);
+            return false;
+        }
 
-    ArduinoJson::JsonDocument doc;
-    if (ArduinoJson::deserializeJson(doc, resp)) {
-        mclog::tagError(_tag, "{} setup: failed to parse response", work_id);
-        return false;
+        ArduinoJson::JsonDocument doc;
+        if (ArduinoJson::deserializeJson(doc, resp)) {
+            mclog::tagError(_tag, "{} setup: failed to parse a response line, skipping", work_id);
+            continue;
+        }
+        std::string candidate_work_id = doc["work_id"] | "";
+        if (candidate_work_id.rfind(expected_prefix, 0) != 0) {
+            mclog::tagInfo(_tag, "{} setup: ignoring stale/unrelated response (work_id={})", work_id, candidate_work_id);
+            continue;
+        }
+
+        int error_code = doc["error"]["code"] | -1;
+        if (error_code != 0) {
+            mclog::tagError(_tag, "{} setup: error code {}", work_id, error_code);
+            return false;
+        }
+        out_work_id = candidate_work_id;
+        mclog::tagInfo(_tag, "{} setup succeeded: {}", work_id, out_work_id);
+        return true;
     }
-    int error_code = doc["error"]["code"] | -1;
-    if (error_code != 0) {
-        mclog::tagError(_tag, "{} setup: error code {}", work_id, error_code);
-        return false;
-    }
-    out_work_id = doc["work_id"].as<std::string>();
-    mclog::tagInfo(_tag, "{} setup succeeded: {}", work_id, out_work_id);
-    return true;
 }
 
 bool OfflineAgentModule::setupKws()
@@ -569,43 +553,55 @@ bool OfflineAgentModule::setupLlm()
             data["max_token_len"] = 1023;
             data["temperature"] = 0.7;
             data["top_p"] = 0.9;
-            data["prompt"] = "You are Becky, a friendly offline voice assistant.";
+            data["prompt"] = kSystemPrompt;
         },
         _llm_work_id);
 }
 
 bool OfflineAgentModule::setupMelotts()
 {
-    // response_format "sys.pcm" + enoutput:false - this is the ACTUAL
-    // official pattern, confirmed from two independent sources:
-    // M5ModuleLLM Arduino library's own ApiMelottsSetupConfig_t default
-    // (enoutput = false), and M5Stack's own Python "AI Pyramid" voice
-    // assistant reference implementation (same response_format,
-    // explicit enoutput: false). We had enoutput:true this whole time -
-    // copied from the pattern that's correct for kws/vad/asr/llm (where
-    // we genuinely need their messages), but wrong for melotts. That
-    // single flag was very likely the actual root cause of everything
-    // fought over the past two days: melotts echoing its full audio
-    // payload back to us on every chunk, saturating the UART link
-    // (fixed at 115200 baud, confirmed non-configurable - llm-sys
-    // silently reverts any externally-forced baud change) with data we
-    // never used, causing both the transmission corruption we hit with
-    // "pcm.stream.base64" and the multi-minute delays we measured with
-    // "sys.play.0_1.stream".
+    // Chained directly to the LLM's own work_id ("tts.utf-8.stream"
+    // input chained to llm_work_id) - matching M5Stack's own official
+    // Voice Assistant reference pattern, rather than us collecting the
+    // LLM's full response and sending ONE explicit melotts inference
+    // call afterward. Confirmed directly via probe_melotts_chaining.py:
+    // on a typical multi-sentence response, speech started ~3.1s after
+    // the prompt was sent, while the LLM didn't finish generating the
+    // full text until ~54.7s in - a genuine ~51.6s of previously-silent
+    // waiting time recovered. StackFlow feeds melotts tokens as the LLM
+    // produces them internally, entirely within Module LLM - this
+    // requires setupLlm() to have already run (see start()) so
+    // _llm_work_id exists.
     //
-    // With enoutput:false, melotts sends NOTHING back to us at all -
-    // Module LLM plays it locally, full stop. That also means there is
-    // no server-side "finish" signal of any kind anymore (by design),
-    // so state transitions rely entirely on the text-length timing
-    // estimate (see sendMelottsInference / update()) - a fair trade
-    // given the "real" signal was never practically usable for longer
-    // responses anyway.
+    // Real trade-off worth being explicit about: since melotts now
+    // receives the LLM's raw output directly (never passing through
+    // our own code again), we can no longer preprocess the text before
+    // synthesis - specifically, the contraction-expansion workaround
+    // (fixing MeloTTS mispronouncing contractions) no longer applies at
+    // all. Best available mitigation: ask the LLM itself, via the
+    // system prompt, to avoid contractions (see setupLlm()) - less
+    // reliable than direct text rewriting, but the only lever chaining
+    // leaves us.
+    //
+    // response_format "sys.pcm" + enoutput:false unchanged - still the
+    // correct official pattern, still zero audio data crossing the
+    // UART link in either direction.
+    //
+    // KNOWN, TEMPORARY side effect of doing this in isolation (Step 1
+    // of 2): our Speaking-state duration estimate (see
+    // handleLlmDelta()) is still anchored to when the LLM FINISHES
+    // generating, not when speech actually starts (~3s in per the
+    // probe) - meaning follow-up-window timing will be measurably off
+    // until Step 2 (redesigning the state-transition/estimate logic
+    // for chained playback) is done as a separate, dedicated follow-up.
     return do_setup(_impl->uart_num, _impl->rx_buffer, _impl->tx_mutex,
         "melotts", "melotts.setup",
-        [](ArduinoJson::JsonObject data) {
+        [this](ArduinoJson::JsonObject data) {
             data["model"] = "melotts-en-us";
             data["response_format"] = "sys.pcm";
-            data["input"] = "tts.utf-8";
+            auto input = data["input"].to<ArduinoJson::JsonArray>();
+            input.add("tts.utf-8.stream");
+            input.add(_llm_work_id);
             data["voice"] = "alloy";
             data["enoutput"] = false;
         },
@@ -647,7 +643,7 @@ void OfflineAgentModule::update()
     // applying this alone). The actual cause is UART bandwidth: every
     // chunk still carries the full (unused) audio payload, and 115200
     // baud is a hard, non-configurable ceiling (see header comment) -
-    // see the _speaking_started_ms / _estimated_speech_ms race below,
+    // see the _turn_started_ms / _estimated_speech_ms logic below,
     // which is the real fix.
     size_t search_start = 0;
     size_t last_processed_end = 0;
@@ -666,25 +662,44 @@ void OfflineAgentModule::update()
         _impl->rx_buffer.erase(0, last_processed_end);
     }
 
-    // With enoutput:false (see setupMelotts()), melotts sends nothing
-    // back to us at all - this timing estimate is the ONLY mechanism
-    // for detecting speech completion, not a race against a real
-    // signal anymore.
+    // FALLBACK mechanism now, not the sole one: the Option B native
+    // helper (melotts_finish_helper.c, running separately on Module
+    // LLM) polls the audio unit's real queue_status and injects a
+    // genuine finish signal the moment playback is actually complete
+    // (handled directly in handleLine()) - that fires first in
+    // practice, and _finish_queued (checked in handleMelottsFinished())
+    // prevents this estimate from firing again afterward. This estimate
+    // still matters as a safety net for whenever the helper isn't
+    // running (it's a separate process, not yet wired into boot).
     //
     // Deliberately re-fetching the timestamp here rather than reusing
     // "now" from the top of this function: handleLine() above (via
-    // handleLlmDelta -> sendMelottsInference) can set
-    // _speaking_started_ms to a NEWER timestamp than "now" within this
-    // SAME update() call, if the LLM's response finished on this exact
-    // tick. Reusing the stale "now" then produced a NEGATIVE elapsed
-    // time - which, in unsigned arithmetic, wraps around to a huge
-    // value instead (confirmed directly: observed "elapsed" of
-    // 4294967290ms, essentially UINT32_MAX), triggering an instant,
-    // spurious "estimate elapsed" and cutting speech off immediately
-    // after it started.
+    // handleLlmDelta) can set _llm_finished_ms to a NEWER timestamp
+    // than "now" within this SAME update() call, if generation finished
+    // on this exact tick. Reusing the stale "now" would then produce a
+    // NEGATIVE elapsed time - which, in unsigned arithmetic, wraps
+    // around to a huge value instead (confirmed directly in an earlier
+    // version of this logic: observed "elapsed" of 4294967290ms,
+    // essentially UINT32_MAX).
     if (_state == State::Speaking && !_finish_queued && _estimated_speech_ms > 0) {
         uint32_t fresh_now = esp_timer_get_time() / 1000;
-        uint32_t elapsed = fresh_now - _speaking_started_ms;
+        // Step 2 of the melotts-chaining redesign: target time is
+        // MAX(turn_started + estimate, llm_finished) - NOT simply
+        // llm_finished + estimate (the original design, before
+        // chaining). Since speech now starts almost immediately and
+        // continues THROUGHOUT generation rather than after it, by the
+        // time generation finishes speech may already be substantially
+        // or entirely complete - confirmed directly via production
+        // data: a 57.6s-to-generate response was previously followed by
+        // a FURTHER 71.4s wait, even though speech had almost certainly
+        // been running continuously for most/all of that 57.6s already.
+        // The MAX still protects the other direction too - a response
+        // that took unusually long to START generating won't get cut
+        // off early, since we never transition before the full text
+        // actually exists (_llm_finished_ms).
+        uint32_t speaking_target = _turn_started_ms + _estimated_speech_ms;
+        uint32_t target = (speaking_target > _llm_finished_ms) ? speaking_target : _llm_finished_ms;
+        uint32_t elapsed = fresh_now - _turn_started_ms;
         // kAcousticSettlingMs: brief buffer before re-arming vad/whisper,
         // giving any echo/reverb from Becky's own just-finished speech
         // time to physically decay first. Confirmed real via direct
@@ -696,7 +711,7 @@ void OfflineAgentModule::update()
         // not anything actually said. An earlier test found no cross-
         // talk DURING active speech, but never tested this specific
         // acoustic-tail-end window right as playback ends.
-        if (elapsed >= _estimated_speech_ms + kAcousticSettlingMs) {
+        if (fresh_now >= target + kAcousticSettlingMs) {
             mclog::tagInfo(_tag, "Estimated speech duration elapsed ({}ms) - entering follow-up window", elapsed);
             handleMelottsFinished(true);
         }
@@ -723,11 +738,6 @@ void OfflineAgentModule::update()
 
 void OfflineAgentModule::handleLine(const std::string& jsonLine)
 {
-    // No melotts fast-path anymore - with enoutput:false (see
-    // setupMelotts()), melotts never sends us anything at all, so no
-    // incoming line will ever match its work_id. State transitions out
-    // of Speaking rely entirely on the timing estimate in update().
-
     ArduinoJson::JsonDocument doc;
     if (ArduinoJson::deserializeJson(doc, jsonLine)) {
         mclog::tagError(_tag, "Failed to parse line: {}", jsonLine);
@@ -745,11 +755,29 @@ void OfflineAgentModule::handleLine(const std::string& jsonLine)
     } else if (work_id == _llm_work_id) {
         auto data = doc["data"];
         handleLlmDelta(data["delta"] | "", data["finish"] | false);
+    } else if (work_id == _melotts_work_id) {
+        // Real signal from the Option B native helper (melotts_finish_helper.c,
+        // running on Module LLM), polling the actual queue_status RPC action
+        // and injecting this message the moment playback is genuinely
+        // complete - not a timing estimate. melotts itself still sends
+        // nothing (enoutput:false unchanged), so this only ever arrives
+        // from the helper.
+        //
+        // Guarded to only act while genuinely in Speaking: the helper
+        // fires this on ANY busy->idle transition in the audio unit's
+        // queue, which includes the wake-word chime's own playback
+        // finishing, not just real speech. Ignoring it outside Speaking
+        // means a chime-triggered firing is simply harmless noise here,
+        // rather than needing the helper itself to distinguish chime
+        // playback from real speech.
+        if (_state == State::Speaking && !_finish_queued) {
+            auto data = doc["data"];
+            if (data["finish"] | false) {
+                mclog::tagInfo(_tag, "Real playback-complete signal received (Option B helper)");
+                handleMelottsFinished(true);
+            }
+        }
     }
-    // melotts messages never reach here - the fast-path above always
-    // intercepts them first, now that we've confirmed their actual
-    // shape (a single giant non-streamed message, no delta/finish
-    // fields at all).
     // Anything else (echoes of our own setup/exit requests handled
     // synchronously elsewhere) is ignored here.
 }
@@ -844,25 +872,195 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
         return;
     }
     mclog::tagInfo(_tag, "ASR result: {}", text);
-    _accumulated_llm_text.clear();
     setState(State::Processing);
+    // Anchor point for the Step 2 duration-estimate redesign (see
+    // update()) - the turn begins here, not when generation finishes.
+    _turn_started_ms = esp_timer_get_time() / 1000;
     // Logged/captioned text stays the original spoken words - only
     // what actually goes to the LLM gets augmented, so the on-screen
     // caption and logs still reflect what was really said.
     std::string augmented = _prompt_augment_cb ? _prompt_augment_cb(text) : text;
+
+    // Proactive context-window management: reset BEFORE we'd overflow
+    // the model's real 128-token ceiling, rather than letting its own
+    // automatic overflow-recovery handle it silently. Confirmed via
+    // main_llm.cpp review: on overflow, SetKVCache() fails, the system
+    // resets to just the system prompt, but the ALREADY-COMPUTED
+    // tokens_diff (built against the old, longer context) gets applied
+    // against the freshly-reset, shorter cache anyway - a real mismatch
+    // that plausibly explains the bizarre, completely unrelated
+    // math-problem response we saw once the ceiling was exceeded.
+    // kResetThresholdChars (~100 tokens at a rough ~4 chars/token
+    // estimate) leaves headroom below the real 128-token ceiling for
+    // this turn's own question+answer to still fit.
+    constexpr size_t kResetThresholdChars = 400;
+    if (_conversation_char_estimate + augmented.size() >= kResetThresholdChars) {
+        mclog::tagInfo(_tag, "Conversation approaching context limit ({} chars accumulated) - "
+                             "resetting with a continuity hint", _conversation_char_estimate);
+        // Brief, cheap continuity hint from the prior turn's own
+        // response (truncated - injecting the WHOLE thing would defeat
+        // the point of resetting at all), chosen over a silent reset
+        // specifically for a voice assistant's sake: Becky should sound
+        // like she's continuing the conversation, not restarting it.
+        //
+        // Skipped entirely if the prior response was abnormally long -
+        // confirmed as a real, necessary guard via direct observation:
+        // a response that ran the full ~261s to max_token_len (1023
+        // tokens) turned out to be a rambling, unrelated, repetitive
+        // hallucination (an off-topic CSS tutorial, in Chinese, with no
+        // connection to the actual question asked). A healthy response
+        // never comes close to that ceiling, so hitting it is itself a
+        // warning sign. Without this guard, the hint would blindly
+        // carry the hallucinated content forward into the next turn,
+        // reinforcing it rather than giving the reset a genuine chance
+        // to recover - confirmed directly: exactly this happened, with
+        // Becky continuing to discuss CSS on the very next exchange.
+        constexpr size_t kHintMaxChars = 80;
+        constexpr size_t kRunawayResponseChars = 800;
+        std::string prompt_prefix;
+        if (_accumulated_llm_text.size() < kRunawayResponseChars) {
+            std::string hint = _accumulated_llm_text.substr(0, kHintMaxChars);
+            if (_accumulated_llm_text.size() > kHintMaxChars) hint += "...";
+            prompt_prefix = "[Earlier we were discussing: " + hint + "] ";
+        } else {
+            mclog::tagInfo(_tag, "Prior response abnormally long ({} chars) - likely a runaway "
+                                 "generation, skipping continuity hint", _accumulated_llm_text.size());
+        }
+        // Strip sensor/GPS bracket augmentation specifically for this
+        // post-reset turn - confirmed as the real, consistent pattern
+        // across every runaway failure seen so far: each one coincided
+        // with a bracketed sensor/GPS reading landing as the very first
+        // thing the model saw right after a reset, while the one reset
+        // WITHOUT a bracket (a plain "How are you?") came back
+        // completely normal. The live reading is deferred to whatever
+        // natural follow-up comes next, once the context is already
+        // warmed up with a real exchange - a less complete first
+        // answer traded for avoiding a repeat of the catastrophic
+        // runaway failures (270+ second responses of unrelated code,
+        // random digits, or repetitive loops).
+        std::string post_reset_text = augmented;
+        if (augmented != text) {
+            mclog::tagInfo(_tag, "Deferring sensor/GPS data past this reset - answering "
+                                 "the plain question only this turn");
+            post_reset_text = text;
+        }
+        _pending_prompt_after_reset = prompt_prefix + post_reset_text;
+        _accumulated_llm_text.clear();
+        _reset_pending = true;
+        // melotts is chained directly to the LLM's own output stream
+        // (see setupMelotts()) - it would otherwise hear and SPEAK the
+        // reset's own "Context has been reset." reply, an awkward,
+        // out-of-character moment right before the natural,
+        // hint-continued answer. Unlinking first (re-linked once the
+        // reset confirmation arrives - see handleLlmDelta()) prevents
+        // it from ever being heard at all.
+        sendLinkAction("unlink", _melotts_work_id, _llm_work_id);
+        sendLlmInference("reset");
+        return;
+    }
+
+    _accumulated_llm_text.clear();
+    _conversation_char_estimate += augmented.size();
     sendLlmInference(augmented);
 }
 
 void OfflineAgentModule::handleLlmDelta(const std::string& textDelta, bool finished)
 {
     if (_state != State::Processing) return;
+
+    if (_reset_pending) {
+        // Silently accumulate and discard the "Context has been
+        // reset." confirmation - never spoken (melotts is unlinked -
+        // see handleAsrResult()), never treated as a real answer. Once
+        // it completes, re-link melotts, re-anchor timing for the REAL
+        // turn about to start, and send the held, hint-augmented
+        // prompt.
+        if (!finished) return;
+        _reset_pending = false;
+        mclog::tagInfo(_tag, "Context reset confirmed - re-linking melotts and sending held prompt");
+        sendLinkAction("link", _melotts_work_id, _llm_work_id);
+        // Deliberate pause before sending the real prompt - testing
+        // directly whether sending it too quickly races against the
+        // model's own internal state (KV-cache/prefill) not yet being
+        // fully settled by the time "Context has been reset." is sent
+        // back to us. Confirmed as a real, consistent pattern via
+        // direct observation across multiple fresh-boot tests: every
+        // single runaway/garbled response seen so far (an unrelated
+        // coding problem, a car-speed math problem, repeated hundreds
+        // of digits) happened immediately after a reset, regardless of
+        // the actual question's own content - strongly suggesting the
+        // timing of the reset itself, not what's asked afterward, is
+        // the real trigger.
+        vTaskDelay(pdMS_TO_TICKS(300));
+        _conversation_char_estimate = kSystemPrompt.size();
+        _turn_started_ms = esp_timer_get_time() / 1000;
+        std::string prompt = _pending_prompt_after_reset;
+        _pending_prompt_after_reset.clear();
+        sendLlmInference(prompt);
+        return;
+    }
+
+    // Diagnostic: measure exactly when the LLM's FIRST token arrives,
+    // relative to when this turn began (_turn_started_ms, set in
+    // handleAsrResult() right before sending the prompt). Isolates how
+    // much of the observed ~3s startup delay is the LLM's own
+    // prefill/first-token cost specifically, versus ASR tail latency
+    // (before the prompt was even sent) or melotts's own startup
+    // (after this point) - not logged before, since we only ever
+    // tracked the COMPLETE response's timing, never the first token.
+    // Speaking state (mouth animation, LED) and the caption both now
+    // start on the FIRST token, not the last - confirmed as a real,
+    // noticeable UX gap otherwise: melotts is chained directly to the
+    // LLM's own output (see setupMelotts()) and starts speaking almost
+    // immediately, but the mouth/caption previously only appeared once
+    // the ENTIRE response had finished generating (which, for a long
+    // response, could be 30-90+ seconds AFTER audio had already been
+    // playing) - Becky would be audibly talking with a static, closed
+    // mouth and no caption for however long generation took.
+    bool is_first_token = _accumulated_llm_text.empty() && !textDelta.empty();
+    if (is_first_token) {
+        uint32_t first_token_ms = (esp_timer_get_time() / 1000) - _turn_started_ms;
+        mclog::tagInfo(_tag, "LLM first token received ({}ms after turn start)", first_token_ms);
+        _finish_queued = false;  // reset before this turn's melotts finish signal arrives
+        setState(State::Speaking);
+    }
+
     _accumulated_llm_text += textDelta;
+
+    // Caption updates progressively, live, on every delta - not just
+    // once at the end with the complete text - so it visibly tracks
+    // along with what's actually being spoken as it streams in.
+    if (_speech_text_cb) {
+        _speech_text_cb(_accumulated_llm_text);
+    }
+
     if (!finished) return;
 
     mclog::tagInfo(_tag, "LLM response: {}", _accumulated_llm_text);
-    _finish_queued = false;  // reset before this turn's melotts finish signal arrives
-    setState(State::Speaking);
-    sendMelottsInference(_accumulated_llm_text);
+    _conversation_char_estimate += _accumulated_llm_text.size();
+
+    // Now a plain watchdog, not an estimate: the Option B helper
+    // (melotts_finish_helper, running natively on Module LLM) provides
+    // a REAL completion signal as the primary mechanism (see
+    // handleLine()'s handling of _melotts_work_id messages). This
+    // timer's only remaining job is recovering from the rare case
+    // where the helper isn't running at all - without it, Becky would
+    // get stuck in Speaking forever, since nothing else would ever
+    // trigger the transition.
+    //
+    // A flat, generous duration is simpler and more honest than a
+    // tuned estimate now that accuracy isn't this timer's job -
+    // confirmed directly that trying to keep it "accurate enough to
+    // compete" caused real problems: with both mechanisms running,
+    // whichever fired first won (via _finish_queued), and a tuned
+    // estimate occasionally won that race and cut off a genuine,
+    // still-in-progress sentence (real echo: "...released between 1977
+    // to 2019." followed by ASR picking up "Chiki. They were released
+    // between 1977 to 2019.." - her own tail end). 90s comfortably
+    // exceeds the longest response duration seen so far (~88s).
+    constexpr uint32_t kWatchdogTimeoutMs = 90000;
+    _llm_finished_ms = esp_timer_get_time() / 1000;
+    _estimated_speech_ms = kWatchdogTimeoutMs;
 }
 
 void OfflineAgentModule::handleMelottsFinished(bool finished)

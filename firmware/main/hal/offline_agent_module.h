@@ -35,10 +35,19 @@
 // the UART link (fixed, non-configurable 115200 baud - confirmed
 // llm-sys silently reverts any externally-forced baud change) with
 // data we never used, causing multi-minute delays on longer responses.
-// Since melotts now sends nothing at all, state transitions out of
-// Speaking rely entirely on a text-length-based timing estimate (see
-// sendMelottsInference() / update()) - there is no server-side
-// completion signal to use even in principle anymore, by design.
+//
+// melotts is now chained directly to the LLM's own work_id at setup
+// time ("tts.utf-8.stream" input chained to llm_work_id), matching
+// M5Stack's own official Voice Assistant reference pattern, rather
+// than us collecting the LLM's full response and sending one explicit
+// inference call. Confirmed via direct testing to start speech ~51s
+// earlier on a typical multi-sentence response. Since melotts still
+// sends nothing back (enoutput:false), state transitions out of
+// Speaking still rely on a text-length-based timing estimate (see
+// handleLlmDelta() / update()) - though that estimate is currently
+// still anchored to when the LLM finishes generating, not when speech
+// actually starts - a known, deliberate placeholder pending a dedicated
+// follow-up to redesign it properly for chained playback.
 #pragma once
 #include <driver/uart.h>
 #include <string>
@@ -90,6 +99,7 @@ public:
     // pipeline's own SetChatMessage() behavior.
     using SpeechTextCallback = std::function<void(const std::string& text)>;
     void onSpeechText(SpeechTextCallback cb) { _speech_text_cb = cb; }
+
     // Optional: fired with the raw ASR text right before it's sent to
     // the LLM. Returns the text to actually send (unchanged, or with
     // sensor data appended). This is how GPS/environment sensor
@@ -140,7 +150,6 @@ private:
     void handleMelottsFinished(bool finished);
 
     void sendLlmInference(const std::string& text);
-    void sendMelottsInference(const std::string& text);
 
     // Sends a bare {"work_id":..., "action":"work"/"pause"} request -
     // confirmed via direct testing (test_pause_resume.py) to reliably
@@ -153,6 +162,14 @@ private:
     // normal dormant state.
     void sendWorkAction(const std::string& work_id);
     void sendPauseAction(const std::string& work_id);
+
+    // link/unlink a unit's input to/from another unit's work_id at
+    // runtime (matching README.md's documented "link" action) - used
+    // specifically to temporarily disconnect melotts from the LLM's
+    // output stream around a context reset, so it never hears (and
+    // speaks) the reset's own "Context has been reset." confirmation.
+    void sendLinkAction(const std::string& action, const std::string& work_id,
+                        const std::string& target_work_id);
 
     // Follow-up window: after speech finishes, listen for a follow-up
     // utterance without requiring the wake word again, matching the
@@ -174,8 +191,38 @@ private:
     // server-side completion signal to use even in principle, so this
     // estimate is the sole mechanism for detecting speech completion,
     // not a fallback for a real signal.
-    uint32_t _speaking_started_ms = 0;
+    //
+    // Step 2 of the melotts-chaining redesign: since melotts now starts
+    // speaking almost immediately and continues THROUGHOUT generation
+    // (not after it), _turn_started_ms anchors to when the turn began
+    // (prompt sent), not when generation finished - confirmed via real
+    // production data that anchoring to generation-finish (the
+    // previous design) added a large, mostly-redundant wait on top of
+    // time speech had already been running: a 57.6s-to-generate
+    // response added a FURTHER 71.4s wait afterward, even though speech
+    // had almost certainly been running continuously for most/all of
+    // that 57.6s already. _llm_finished_ms is the safeguard - we can
+    // never transition before generation has actually finished (the
+    // full text must exist before speech can possibly be complete), so
+    // update() takes MAX(turn_started + estimate, llm_finished).
+    uint32_t _turn_started_ms = 0;
     uint32_t _estimated_speech_ms = 0;
+    uint32_t _llm_finished_ms = 0;
+
+    // Proactive context-window management (see handleAsrResult() /
+    // handleLlmDelta()): a running character-count estimate of
+    // everything currently in the model's real 128-token context
+    // (system prompt + every turn since the last reset), used to
+    // trigger our OWN clean reset (with a brief continuity hint)
+    // before the model's own automatic overflow-recovery would kick in
+    // - confirmed via main_llm.cpp review to risk a stale-tokens_diff
+    // mismatch against the freshly-reset cache, plausibly explaining a
+    // real, observed bizarre/unrelated response once the ceiling was
+    // exceeded. _reset_pending / _pending_prompt_after_reset hold state
+    // across the brief unlink -> reset -> relink + send sequence.
+    uint32_t _conversation_char_estimate = 0;
+    bool _reset_pending = false;
+    std::string _pending_prompt_after_reset;
 
     std::string _kws_work_id, _vad_work_id, _asr_work_id, _llm_work_id, _melotts_work_id;
     std::string _accumulated_asr_text;

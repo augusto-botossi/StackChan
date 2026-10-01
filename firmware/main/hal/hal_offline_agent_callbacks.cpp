@@ -73,11 +73,19 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                 // self-explanatory - lets the LLM give a genuine verdict
                 // itself rather than us hardcoding our own good/bad
                 // thresholds (risking getting BSEC's own categorization wrong).
+                // Natural-language phrasing (spelled-out words, no
+                // glued units like "24.9C", no nested parentheticals,
+                // no slash notation like "0/3") - tried after a real
+                // regression, though the evidence is mixed: an earlier
+                // log showed this exact same dense/glued format working
+                // fine when NOT near a reset, suggesting post-reset
+                // context fragility is the more likely root cause, not
+                // this formatting itself. Low-risk to try regardless.
                 augmented += fmt::format(
-                    " [Current sensor reading: temperature {:.1f}C, humidity {:.1f}%, pressure {:.1f}hPa, "
-                    "air quality index (IAQ) {:.0f} (0-500 scale, lower is better; accuracy {}/3, "
-                    "where 0 means still calibrating), estimated CO2 equivalent {:.0f}ppm]",
-                    r.temperatureC, r.humidityPct, r.pressureHpa, r.iaq, r.iaqAccuracy, r.co2EquivalentPpm);
+                    " [Current conditions: temperature is {:.1f} degrees Celsius, humidity is {:.0f} percent, "
+                    "pressure is {:.0f} hectopascals, air quality index is {:.0f} out of 500 where lower is "
+                    "better, carbon dioxide level is about {:.0f} parts per million.]",
+                    r.temperatureC, r.humidityPct, r.pressureHpa, r.iaq, r.co2EquivalentPpm);
             } else {
                 augmented += " [No environment sensor reading currently available]";
             }
