@@ -148,6 +148,11 @@ private:
     // this just watches for the finish signal to know when speech is
     // actually done, so we can return to Idle and listen again.
     void handleMelottsFinished(bool finished);
+    // Abandons a turn whose LLM stream went silent before sending finish:true
+    // (see update()) so the device recovers instead of waiting forever.
+    void handleLlmStall(uint32_t silent_ms);
+    // Stops a generation that is repeating itself (see handleLlmDelta()).
+    void handleLlmRunaway();
 
     void sendLlmInference(const std::string& text);
 
@@ -223,6 +228,23 @@ private:
     uint32_t _conversation_char_estimate = 0;
     bool _reset_pending = false;
     std::string _pending_prompt_after_reset;
+    // Guards against deferring sensor/GPS data twice in a row (see
+    // handleAsrResult()) - without this, a low reset threshold could
+    // mean the real reading never actually gets through if the user
+    // simply asks again.
+    bool _sensor_data_just_deferred = false;
+
+    // LLM stall watchdog (see update() / handleLlmStall()): time of the most
+    // recent LLM output for the current turn, and whether that turn's
+    // finish:true has been processed yet.
+    uint32_t _last_llm_activity_ms = 0;
+    bool _llm_turn_finished = true;
+
+    // Runaway-loop guard: set once the current answer was cut off for repeating itself, so the
+    // rest of that turn's stream is ignored; the next turn then starts with a clean context reset.
+    bool _runaway_handled = false;
+    bool _force_reset_next_turn = false;
+    uint32_t _melotts_relink_due_ms = 0;  // 0 = nothing pending
 
     std::string _kws_work_id, _vad_work_id, _asr_work_id, _llm_work_id, _melotts_work_id;
     std::string _accumulated_asr_text;

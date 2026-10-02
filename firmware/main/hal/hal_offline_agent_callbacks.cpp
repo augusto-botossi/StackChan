@@ -5,6 +5,7 @@
 #include <mooncake_log.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <cmath>
 #include <apps/common/common.h>
 #include <assets/assets.h>
 
@@ -43,22 +44,41 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
 
         std::string augmented = asr_text;
 
-        bool wants_location = lower.find("where") != std::string::npos ||
-                               lower.find("location") != std::string::npos ||
-                               lower.find("gps") != std::string::npos;
-        bool wants_environment = lower.find("temperature") != std::string::npos ||
-                                  lower.find("weather") != std::string::npos ||
-                                  lower.find("humidity") != std::string::npos ||
-                                  lower.find("air quality") != std::string::npos;
+        // Confirmed real: "tell me our position" and "give our current coordinates" matched
+        // none of the old keywords (where/location/gps), so no GPS reading was attached and
+        // the model invented an address. Broader lists below; a stray match (e.g. "peer
+        // pressure") just attaches a reading the model ignores.
+        auto contains_any = [&lower](std::initializer_list<const char*> words) {
+            for (const char* w : words) {
+                if (lower.find(w) != std::string::npos) return true;
+            }
+            return false;
+        };
+        bool wants_location = contains_any({"where am", "where are", "where is", "location", "gps", "position", "coordinates",
+                                            "latitude", "longitude", "altitude", "elevation",
+                                            "how high", "located"});
+        bool wants_environment = contains_any({"temperature", "weather", "humidity", "air quality",
+                                               "pressure", "carbon dioxide", "co2", "how hot",
+                                               "how cold"});
 
         if (wants_location && GetHAL().getGps()) {
             auto fix = GetHAL().getGps()->getLastFix();
             if (fix.valid) {
+                // Natural-language phrasing, like the environment reading: the dense
+                // "latitude 50.257415, longitude 8.642969, altitude 201.4m ..." form was
+                // IGNORED by the model ("I do not yet have the current location
+                // information") although it was attached, while the spelled-out
+                // environment reading is read back correctly. 4 decimals (~11 m) is
+                // plenty for speech.
                 augmented += fmt::format(
-                    " [Current GPS reading: latitude {:.6f}, longitude {:.6f}, altitude {:.1f}m, speed {:.1f}km/h, {} satellites]",
-                    fix.latitude, fix.longitude, fix.altitudeM, fix.speedKmh, fix.satellites);
+                    " Current position: latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}, "
+                    "altitude is {:.0f} meters above sea level, speed is {:.1f} kilometers per hour, "
+                    "and {} satellites are in view.",
+                    std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
+                    std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west",
+                    fix.altitudeM, fix.speedKmh, fix.satellites);
             } else {
-                augmented += " [No GPS fix currently available]";
+                augmented += " No GPS fix is currently available.";
             }
         }
 
@@ -82,12 +102,12 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                 // context fragility is the more likely root cause, not
                 // this formatting itself. Low-risk to try regardless.
                 augmented += fmt::format(
-                    " [Current conditions: temperature is {:.1f} degrees Celsius, humidity is {:.0f} percent, "
+                    " Current conditions: temperature is {:.1f} degrees Celsius, humidity is {:.0f} percent, "
                     "pressure is {:.0f} hectopascals, air quality index is {:.0f} out of 500 where lower is "
-                    "better, carbon dioxide level is about {:.0f} parts per million.]",
+                    "better, carbon dioxide level is about {:.0f} parts per million.",
                     r.temperatureC, r.humidityPct, r.pressureHpa, r.iaq, r.co2EquivalentPpm);
             } else {
-                augmented += " [No environment sensor reading currently available]";
+                augmented += " No environment sensor reading is currently available.";
             }
         }
 

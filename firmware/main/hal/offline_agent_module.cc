@@ -6,6 +6,8 @@
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <system_info.h>
+#include <algorithm>
+#include <cctype>
 #include <utility>
 
 #include <freertos/FreeRTOS.h>
@@ -551,7 +553,17 @@ bool OfflineAgentModule::setupLlm()
             data["input"] = "llm.utf-8";
             data["enoutput"] = true;
             data["max_token_len"] = 1023;
-            data["temperature"] = 0.7;
+            // Sampling. The unit's own log shows it applies request values (top_p 0.9 arrives
+            // intact) but ships with enable_temperature / enable_repetition_penalty OFF, so
+            // temperature and any penalty were inert and only top-k=10 sampling was active -
+            // a plausible cause of the repetition stutter ("smooth, smooth, smooth", "for for")
+            // and of the runaway loops. Verify in the journal: the last "load config" block
+            // after a setup must show these flags as true. Values are untuned starting points.
+            data["enable_temperature"] = true;
+            data["temperature"] = 0.6;
+            data["enable_repetition_penalty"] = true;
+            data["repetition_penalty"] = 1.1;
+            data["penalty_window"] = 50;
             data["top_p"] = 0.9;
             data["prompt"] = kSystemPrompt;
         },
@@ -662,6 +674,30 @@ void OfflineAgentModule::update()
         _impl->rx_buffer.erase(0, last_processed_end);
     }
 
+    // Re-link melotts a few seconds after a runaway answer was cut off (it was unlinked so the
+    // looping text would stop being spoken - see handleLlmRunaway()).
+    if (_melotts_relink_due_ms != 0) {
+        uint32_t relink_now = esp_timer_get_time() / 1000;
+        if (static_cast<int32_t>(relink_now - _melotts_relink_due_ms) >= 0) {
+            sendLinkAction("link", _melotts_work_id, _llm_work_id);
+            _melotts_relink_due_ms = 0;
+        }
+    }
+
+    // LLM stall watchdog: if generation goes silent - no output at all for
+    // kLlmStallTimeoutMs - before its finish:true arrives, the stream is dead
+    // (e.g. the llm unit crashed or was restarted on Module LLM). Nothing else
+    // would ever end such a turn. Normal gaps are tiny (first token ~1.7s, then
+    // ~0.2s per token); even a runaway generation keeps streaming, so it never
+    // trips this - it only catches a genuine stall.
+    if ((_state == State::Processing || _state == State::Speaking) && !_llm_turn_finished) {
+        constexpr uint32_t kLlmStallTimeoutMs = 20000;
+        uint32_t stall_now = esp_timer_get_time() / 1000;
+        if (stall_now - _last_llm_activity_ms > kLlmStallTimeoutMs) {
+            handleLlmStall(stall_now - _last_llm_activity_ms);
+        }
+    }
+
     // FALLBACK mechanism now, not the sole one: the Option B native
     // helper (melotts_finish_helper.c, running separately on Module
     // LLM) polls the audio unit's real queue_status and injects a
@@ -697,9 +733,13 @@ void OfflineAgentModule::update()
         // that took unusually long to START generating won't get cut
         // off early, since we never transition before the full text
         // actually exists (_llm_finished_ms).
-        uint32_t speaking_target = _turn_started_ms + _estimated_speech_ms;
-        uint32_t target = (speaking_target > _llm_finished_ms) ? speaking_target : _llm_finished_ms;
-        uint32_t elapsed = fresh_now - _turn_started_ms;
+        // Counted from when the LLM FINISHED, not from turn start: measured from turn
+        // start, any generation longer than the timer (a 100s answer vs 90s) made this fire
+        // the instant generation ended, opening the follow-up window while Becky was still
+        // speaking the last ~20s of her answer (speech lags generation) - confirmed in a
+        // real log. This is only the fallback for when the helper isn't running.
+        uint32_t target = _llm_finished_ms + _estimated_speech_ms;
+        uint32_t elapsed = fresh_now - _llm_finished_ms;
         // kAcousticSettlingMs: brief buffer before re-arming vad/whisper,
         // giving any echo/reverb from Becky's own just-finished speech
         // time to physically decay first. Confirmed real via direct
@@ -712,7 +752,7 @@ void OfflineAgentModule::update()
         // talk DURING active speech, but never tested this specific
         // acoustic-tail-end window right as playback ends.
         if (fresh_now >= target + kAcousticSettlingMs) {
-            mclog::tagInfo(_tag, "Estimated speech duration elapsed ({}ms) - entering follow-up window", elapsed);
+            mclog::tagInfo(_tag, "Fallback timer elapsed ({}ms after the LLM finished) - entering follow-up window", elapsed);
             handleMelottsFinished(true);
         }
     }
@@ -838,6 +878,80 @@ static bool is_whisper_hallucination(const std::string& text)
     return bracketed || parenthesized;
 }
 
+// Lowercased alphanumeric words of a string (apostrophes dropped, everything else
+// acts as a separator) - just enough normalisation to compare speech transcripts.
+static std::vector<std::string> split_words(const std::string& s)
+{
+    std::vector<std::string> words;
+    std::string cur;
+    for (unsigned char c : s) {
+        if (std::isalnum(c)) {
+            cur.push_back(static_cast<char>(std::tolower(c)));
+        } else if (c == '\'') {
+            continue;
+        } else if (!cur.empty()) {
+            words.push_back(cur);
+            cur.clear();
+        }
+    }
+    if (!cur.empty()) words.push_back(cur);
+    return words;
+}
+
+// True if an ASR transcript is (nearly) a straight quote of the END of Becky's own last
+// answer, i.e. the microphone picked up her own speech. Confirmed real, twice: a
+// follow-up window opened while her final sentence was still being spoken, and ASR
+// returned it word for word ("And the carbon dioxide level is about 500 parts per
+// million.") - and once with a single misheard word ("...the GIF status on your
+// device..." for "GPS") - and it was then answered as if the user had said it.
+// Compares runs of CONSECUTIVE shared words rather than just shared vocabulary, so a
+// genuine question that merely reuses a few of her words is not dropped. A longer
+// transcript (8+ words) may contain one misheard word inside the run.
+static bool looks_like_echo(const std::string& asr_text, const std::string& last_response)
+{
+    const auto asr = split_words(asr_text);
+    // Too short to judge - let short questions through. A 4-word question that sits inside her
+    // last answer ("carbon dioxide level please") would otherwise match 3 of 4 words.
+    if (asr.size() < 6) return false;
+    auto resp = split_words(last_response);
+    if (resp.size() > 60) resp.erase(resp.begin(), resp.end() - 60);  // echo = tail of her speech
+
+    // exact = run of identical words ending at (i, j); fuzzy = same, allowing ONE substituted word
+    size_t best_exact = 0, best_fuzzy = 0;
+    std::vector<size_t> exact_prev(resp.size() + 1, 0), exact_cur(resp.size() + 1, 0);
+    std::vector<size_t> fuzzy_prev(resp.size() + 1, 0), fuzzy_cur(resp.size() + 1, 0);
+    for (size_t i = 1; i <= asr.size(); ++i) {
+        for (size_t j = 1; j <= resp.size(); ++j) {
+            if (asr[i - 1] == resp[j - 1]) {
+                exact_cur[j] = exact_prev[j - 1] + 1;
+                fuzzy_cur[j] = fuzzy_prev[j - 1] + 1;
+            } else {
+                exact_cur[j] = 0;
+                fuzzy_cur[j] = exact_prev[j - 1] + 1;  // spend the one allowed mismatch here
+            }
+            best_exact = std::max(best_exact, exact_cur[j]);
+            best_fuzzy = std::max(best_fuzzy, fuzzy_cur[j]);
+        }
+        std::swap(exact_prev, exact_cur);
+        std::swap(fuzzy_prev, fuzzy_cur);
+    }
+    if (best_exact * 10 >= asr.size() * 7) return true;           // >= 70% straight quote
+    return asr.size() >= 8 && best_fuzzy * 10 >= asr.size() * 8;  // >= 80% with one misheard word
+}
+
+// True once an answer has started repeating itself: its last 150 characters already appeared
+// earlier in the same answer. Confirmed real: a derailed answer looped one paragraph for
+// ~4.7 minutes (1000+ tokens) of speech before hitting the token limit. A healthy answer
+// essentially never repeats 150 characters verbatim. Cheap enough to run on every delta.
+static bool looks_like_runaway(const std::string& text)
+{
+    constexpr size_t kTail = 150;
+    if (text.size() < 3 * kTail) return false;
+    const size_t tail_start = text.size() - kTail;
+    const size_t first = text.find(text.substr(tail_start));
+    return first != std::string::npos && first < tail_start;
+}
+
 void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
 {
     bool in_followup = (_state == State::FollowUp);
@@ -847,9 +961,13 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
                              // act on the final one (seen directly in
                              // testing: two identical messages, only
                              // the second has finish=true).
-    bool nothing_said = text.empty() || is_whisper_hallucination(text);
+    // Only in the follow-up window: that is where Becky's own speech can leak back in.
+    bool is_echo = in_followup && looks_like_echo(text, _accumulated_llm_text);
+    bool nothing_said = text.empty() || is_whisper_hallucination(text) || is_echo;
     if (nothing_said) {
-        if (is_whisper_hallucination(text)) {
+        if (is_echo) {
+            mclog::tagInfo(_tag, "Ignoring ASR result that repeats Becky's own last answer (echo): {}", text);
+        } else if (is_whisper_hallucination(text)) {
             mclog::tagInfo(_tag, "Ignoring likely Whisper hallucination: {}", text);
         }
         // Nothing was said (yet) - ASR's own "nothing heard" timeout is
@@ -876,6 +994,13 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
     // Anchor point for the Step 2 duration-estimate redesign (see
     // update()) - the turn begins here, not when generation finishes.
     _turn_started_ms = esp_timer_get_time() / 1000;
+    // Fresh per-turn state: no output seen yet, nothing finished. Resetting
+    // _estimated_speech_ms matters too - it used to keep the PREVIOUS turn's value,
+    // arming the 90s fallback before this turn's generation had even finished.
+    _last_llm_activity_ms = _turn_started_ms;
+    _llm_turn_finished = false;
+    _estimated_speech_ms = 0;
+    _runaway_handled = false;
     // Logged/captioned text stays the original spoken words - only
     // what actually goes to the LLM gets augmented, so the on-screen
     // caption and logs still reflect what was really said.
@@ -893,8 +1018,20 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
     // kResetThresholdChars (~100 tokens at a rough ~4 chars/token
     // estimate) leaves headroom below the real 128-token ceiling for
     // this turn's own question+answer to still fit.
+    //
+    // EXPERIMENT SWITCH: the 128-token ceiling this logic assumes comes from a docs
+    // line ("128-length context window") that sits next to "maximum output 1024 tokens"
+    // for the same model, and logs show ~1000-token responses completing with no
+    // overflow - so 128 may be the prompt/prefill window, not total conversation
+    // memory. Set to false to run WITHOUT proactive resets and watch the per-turn
+    // "Conversation size estimate" log to find where (if anywhere) answers degrade.
+    constexpr bool kProactiveResetEnabled = false;
     constexpr size_t kResetThresholdChars = 400;
-    if (_conversation_char_estimate + augmented.size() >= kResetThresholdChars) {
+    // _force_reset_next_turn: the previous answer was cut off as a runaway loop, so the model's
+    // context holds that garbage - start this turn from a clean one regardless of the switch.
+    if ((kProactiveResetEnabled && _conversation_char_estimate + augmented.size() >= kResetThresholdChars) ||
+        _force_reset_next_turn) {
+        _force_reset_next_turn = false;
         mclog::tagInfo(_tag, "Conversation approaching context limit ({} chars accumulated) - "
                              "resetting with a continuity hint", _conversation_char_estimate);
         // Brief, cheap continuity hint from the prior turn's own
@@ -918,10 +1055,10 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
         constexpr size_t kHintMaxChars = 80;
         constexpr size_t kRunawayResponseChars = 800;
         std::string prompt_prefix;
-        if (_accumulated_llm_text.size() < kRunawayResponseChars) {
+        if (!_accumulated_llm_text.empty() && _accumulated_llm_text.size() < kRunawayResponseChars) {
             std::string hint = _accumulated_llm_text.substr(0, kHintMaxChars);
             if (_accumulated_llm_text.size() > kHintMaxChars) hint += "...";
-            prompt_prefix = "[Earlier we were discussing: " + hint + "] ";
+            prompt_prefix = "Earlier we were discussing: " + hint + ". ";  // plain text, no brackets
         } else {
             mclog::tagInfo(_tag, "Prior response abnormally long ({} chars) - likely a runaway "
                                  "generation, skipping continuity hint", _accumulated_llm_text.size());
@@ -939,10 +1076,21 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
         // runaway failures (270+ second responses of unrelated code,
         // random digits, or repetitive loops).
         std::string post_reset_text = augmented;
-        if (augmented != text) {
+        if (augmented != text && !_sensor_data_just_deferred) {
+            // Don't defer twice in a row - confirmed as a real, new
+            // problem: our reset threshold (400 chars) is close enough
+            // to the post-reset baseline (~160) that a short exchange
+            // plus the next sensor question can cross it again
+            // immediately, meaning the real reading would never
+            // actually get through if the user simply asks again -
+            // effectively refusing the question forever rather than
+            // just once.
             mclog::tagInfo(_tag, "Deferring sensor/GPS data past this reset - answering "
                                  "the plain question only this turn");
             post_reset_text = text;
+            _sensor_data_just_deferred = true;
+        } else {
+            _sensor_data_just_deferred = false;
         }
         _pending_prompt_after_reset = prompt_prefix + post_reset_text;
         _accumulated_llm_text.clear();
@@ -961,12 +1109,22 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
 
     _accumulated_llm_text.clear();
     _conversation_char_estimate += augmented.size();
+    _sensor_data_just_deferred = false;
     sendLlmInference(augmented);
 }
 
 void OfflineAgentModule::handleLlmDelta(const std::string& textDelta, bool finished)
 {
-    if (_state != State::Processing) return;
+    // Speaking must be accepted here too: the state flips to Speaking on the FIRST
+    // token (see below, so the mouth/caption start with the audio), and every later
+    // delta - including the final finish:true one - still has to be processed.
+    // The previous guard (Processing only) silently dropped all of them: the caption
+    // froze on the first words, "LLM response" was never logged, the character
+    // estimate never grew, and the 90s fallback watchdog was never armed - so a turn
+    // only ended if the Module LLM helper's playback-complete signal happened to arrive.
+    if (_state != State::Processing && _state != State::Speaking) return;
+    if (_runaway_handled) return;  // this turn's answer was cut off; ignore whatever is still in flight
+    _last_llm_activity_ms = esp_timer_get_time() / 1000;
 
     if (_reset_pending) {
         // Silently accumulate and discard the "Context has been
@@ -1034,10 +1192,18 @@ void OfflineAgentModule::handleLlmDelta(const std::string& textDelta, bool finis
         _speech_text_cb(_accumulated_llm_text);
     }
 
+    if (!finished && looks_like_runaway(_accumulated_llm_text)) {
+        handleLlmRunaway();
+        return;
+    }
+
     if (!finished) return;
 
     mclog::tagInfo(_tag, "LLM response: {}", _accumulated_llm_text);
     _conversation_char_estimate += _accumulated_llm_text.size();
+    _llm_turn_finished = true;
+    mclog::tagInfo(_tag, "Conversation size estimate: {} chars (~{} tokens at ~4 chars/token)",
+                   _conversation_char_estimate, _conversation_char_estimate / 4);
 
     // Now a plain watchdog, not an estimate: the Option B helper
     // (melotts_finish_helper, running natively on Module LLM) provides
@@ -1061,6 +1227,49 @@ void OfflineAgentModule::handleLlmDelta(const std::string& textDelta, bool finis
     constexpr uint32_t kWatchdogTimeoutMs = 90000;
     _llm_finished_ms = esp_timer_get_time() / 1000;
     _estimated_speech_ms = kWatchdogTimeoutMs;
+}
+
+void OfflineAgentModule::handleLlmStall(uint32_t silent_ms)
+{
+    mclog::tagError(_tag, "LLM stalled: no output for {}ms (state={}, {} chars received, reset_pending={}) - "
+                          "abandoning this turn. Check llm-llm / llm-melotts on Module LLM.",
+                    silent_ms, (int)_state, _accumulated_llm_text.size(), _reset_pending);
+    if (_reset_pending) {
+        // melotts is still unlinked from the LLM for the context reset - restore the
+        // link, or every later turn would be silent.
+        sendLinkAction("link", _melotts_work_id, _llm_work_id);
+        _reset_pending = false;
+        _pending_prompt_after_reset.clear();
+    }
+    _llm_turn_finished = true;
+    _finish_queued = true;  // a late helper/watchdog signal must not act on this abandoned turn
+    _conversation_char_estimate += _accumulated_llm_text.size();
+    _sensor_data_just_deferred = false;
+    setState(State::Idle);
+}
+
+void OfflineAgentModule::handleLlmRunaway()
+{
+    _runaway_handled = true;
+    uint32_t now = esp_timer_get_time() / 1000;
+    mclog::tagError(_tag, "Runaway answer: it is repeating itself after {} chars - stopping the LLM, "
+                          "silencing speech, and resetting context on the next turn",
+                    _accumulated_llm_text.size());
+    // "pause" calls Stop() on the generator (main_llm.cpp: task_pause). The unit has no resume
+    // action, so it is expected to accept the next inference normally - UNVERIFIED on hardware.
+    sendPauseAction(_llm_work_id);
+    // Unlink melotts so no further looping text reaches TTS; audio already queued still plays.
+    sendLinkAction("unlink", _melotts_work_id, _llm_work_id);
+    _melotts_relink_due_ms = now + 3000;
+    _llm_turn_finished = true;
+    _conversation_char_estimate += _accumulated_llm_text.size();
+    _accumulated_llm_text.clear();   // the next turn must not build a "hint" from garbage
+    _force_reset_next_turn = true;
+    // No finish:true is guaranteed to follow a stopped generation, so arm the fallback by hand:
+    // follow-up opens once the already-queued speech has had time to play out (or sooner, if the
+    // helper reports completion).
+    _llm_finished_ms = now;
+    _estimated_speech_ms = 25000;
 }
 
 void OfflineAgentModule::handleMelottsFinished(bool finished)
