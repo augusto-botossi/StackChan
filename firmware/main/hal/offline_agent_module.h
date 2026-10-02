@@ -153,6 +153,8 @@ private:
     void handleLlmStall(uint32_t silent_ms);
     // Stops a generation that is repeating itself (see handleLlmDelta()).
     void handleLlmRunaway();
+    // Stops the LLM when its end-of-text marker appears in the stream (see handleLlmDelta()).
+    void handleLlmEndOfText(size_t marker_pos);
 
     void sendLlmInference(const std::string& text);
 

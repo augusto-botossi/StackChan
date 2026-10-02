@@ -115,10 +115,21 @@ void OfflineAgentModule::setState(State newState)
 // context-window reset logic (its own length is the post-reset
 // baseline for _conversation_char_estimate) - kept as one definition so
 // they can never silently drift apart.
+//
+// KEEP THIS SHORT. The model's prefill window is 128 tokens and this prompt (plus ~13 tokens of chat
+// template) comes out of it on EVERY turn - what is left is all the room the user's words and any
+// sensor/GPS reading get. The previous version (about 47 tokens with the contraction examples) left
+// room for only ~73 user tokens, which a name plus a full sensor sentence overran. See
+// prompt_user_token_budget().
+// The last sentence is there because of a measured difference (24 answers per wording, new prompts):
+// without it the model ignored an attached position reading 2 times in 6 ("You are currently situated
+// in the heart of Europe...") and refused once ("I do not have the capability to provide real-time
+// temperature readings"); with it, 18 of 18 weather/temperature/position answers used the reading.
 static const std::string kSystemPrompt =
-    "You are Becky, a friendly offline voice assistant. "
-    "Avoid contractions in your responses - write \"do not\" "
-    "instead of \"don't\", \"I am\" instead of \"I'm\", and so on.";
+    "You are Becky, a friendly voice assistant. "
+    "Do not use contractions. "
+    "Answer in at most three short sentences unless asked for more. "
+    "You have sensors; use the readings given with a question.";
 
 static std::string new_request_id()
 {
@@ -952,6 +963,84 @@ static bool looks_like_runaway(const std::string& text)
     return first != std::string::npos && first < tail_start;
 }
 
+// Rough Qwen token count: words + digits (Qwen splits numbers digit by digit) + punctuation, plus a
+// 15% margin. Calibrated against real counts read from the unit's journal: " What is my name?." is
+// 5 tokens (estimate 7), a 290-character weather prompt is 78 (estimate 80), the old system prompt
+// is 42 (estimate 52). Errs high on purpose: the firmware cannot call the unit's tokenizer.
+static size_t estimate_tokens(const std::string& s)
+{
+    size_t words = 0, digits = 0, punct = 0, other = 0;
+    bool in_word = false;
+    for (unsigned char c : s) {
+        if (c >= 0x80) {
+            ++other;
+            in_word = false;
+        } else if (std::isalpha(c)) {
+            if (!in_word) {
+                ++words;
+                in_word = true;
+            }
+        } else {
+            in_word = false;
+            if (std::isdigit(c)) {
+                ++digits;
+            } else if (std::ispunct(c)) {
+                ++punct;
+            }
+        }
+    }
+    const size_t raw = words + digits + punct + other / 2;
+    return (raw * 115 + 99) / 100;
+}
+
+// How many estimated tokens the user's words plus anything we attach may take. The whole prompt
+// (system block + chat template + user text) must stay within the model's 128-token prefill window:
+// in a controlled replay, prompts of 131-133 tokens derailed 40 of 40 times (junk from the very
+// first token), while a 127-token version of the same prompt answered correctly 10 of 10.
+// The limit below leaves 8 tokens of headroom under that cliff, on top of the estimator's margin.
+static size_t prompt_user_token_budget()
+{
+    constexpr size_t kPromptTokenLimit = 120;
+    static const size_t fixed = estimate_tokens(kSystemPrompt) + 5 /* system header+footer */ +
+                                8 /* user header + assistant header */;
+    return kPromptTokenLimit > fixed ? kPromptTokenLimit - fixed : 8;
+}
+
+// Make base+extra fit the budget: first drop trailing sentences of the attachment (extra), then, if
+// the user's own words are still too long, keep only their LAST words (the question usually ends
+// an utterance).
+static std::string fit_to_budget(std::string base, std::string extra, size_t budget)
+{
+    while (!extra.empty() && estimate_tokens(base + extra) > budget) {
+        const size_t from = extra.size() > 3 ? extra.size() - 3 : 0;
+        const size_t cut = extra.rfind(". ", from);
+        extra = (cut == std::string::npos) ? std::string() : extra.substr(0, cut + 1);
+    }
+    if (estimate_tokens(base) > budget) {
+        std::vector<std::string> words;
+        std::string cur;
+        for (char ch : base) {
+            if (ch == ' ') {
+                if (!cur.empty()) {
+                    words.push_back(cur);
+                    cur.clear();
+                }
+            } else {
+                cur.push_back(ch);
+            }
+        }
+        if (!cur.empty()) words.push_back(cur);
+        std::string kept;
+        for (size_t i = words.size(); i-- > 0;) {
+            std::string cand = kept.empty() ? words[i] : words[i] + " " + kept;
+            if (estimate_tokens(cand) > budget) break;
+            kept = cand;
+        }
+        base = kept;
+    }
+    return base + extra;
+}
+
 void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
 {
     bool in_followup = (_state == State::FollowUp);
@@ -1005,6 +1094,27 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
     // what actually goes to the LLM gets augmented, so the on-screen
     // caption and logs still reflect what was really said.
     std::string augmented = _prompt_augment_cb ? _prompt_augment_cb(text) : text;
+
+    // PROMPT LENGTH GUARD - see prompt_user_token_budget(): a prompt over the model's 128-token window
+    // makes it derail from the first token. The callback keeps its attachments short, this is the
+    // safety net: trim the attachment (last sentence first), then the oldest words.
+    {
+        std::string base = text;
+        std::string extra;
+        if (augmented.size() >= text.size() && augmented.compare(0, text.size(), text) == 0) {
+            extra = augmented.substr(text.size());
+        } else {
+            base = augmented;
+        }
+        const size_t budget = prompt_user_token_budget();
+        const size_t wanted = estimate_tokens(base + extra);
+        mclog::tagInfo(_tag, "Prompt size: about {} of {} user tokens", wanted, budget);
+        if (wanted > budget) {
+            augmented = fit_to_budget(base, extra, budget);
+            mclog::tagInfo(_tag, "Prompt too long for the model's 128-token window - trimmed to about {} tokens",
+                           estimate_tokens(augmented));
+        }
+    }
 
     // Proactive context-window management: reset BEFORE we'd overflow
     // the model's real 128-token ceiling, rather than letting its own
@@ -1183,7 +1293,28 @@ void OfflineAgentModule::handleLlmDelta(const std::string& textDelta, bool finis
         setState(State::Speaking);
     }
 
+    const size_t prev_size = _accumulated_llm_text.size();
     _accumulated_llm_text += textDelta;
+
+    // End-of-text marker. The unit only stops on <|im_end|> (its log says eos_id 151645), but the
+    // model sometimes ends with Qwen's other terminator <|endoftext|> (151643) - and the unit then
+    // keeps going, writing a brand-new unrelated "document". Seen in two derailed answers: one
+    // ended its code explanation and went on with "A car is traveling at 18 mph...", another went
+    // from a weather question into "Human Heart: Function and Structure" and ran 279 s. Cut the
+    // answer right here. The search starts a little before the new text because the marker can
+    // arrive split across two chunks.
+    {
+        constexpr size_t kMarkerLen = 13;  // strlen("<|endoftext|>")
+        const size_t from = prev_size >= kMarkerLen - 1 ? prev_size - (kMarkerLen - 1) : 0;
+        const size_t eot = _accumulated_llm_text.find("<|endoftext|>", from);
+        if (eot != std::string::npos) {
+            if (!finished) {
+                handleLlmEndOfText(eot);
+                return;
+            }
+            _accumulated_llm_text.resize(eot);  // the answer is ending anyway: just drop the marker
+        }
+    }
 
     // Caption updates progressively, live, on every delta - not just
     // once at the end with the complete text - so it visibly tracks
@@ -1248,12 +1379,37 @@ void OfflineAgentModule::handleLlmStall(uint32_t silent_ms)
     setState(State::Idle);
 }
 
+void OfflineAgentModule::handleLlmEndOfText(size_t marker_pos)
+{
+    _runaway_handled = true;  // ignore the rest of this turn's stream
+    uint32_t now = esp_timer_get_time() / 1000;
+    _accumulated_llm_text.resize(marker_pos);  // keep only what came before the marker
+    mclog::tagInfo(_tag, "End-of-text marker after {} chars: the model finished its answer but the unit "
+                         "would have kept generating - stopping it",
+                   marker_pos);
+    mclog::tagInfo(_tag, "LLM response: {}", _accumulated_llm_text);
+    if (_speech_text_cb) {
+        _speech_text_cb(_accumulated_llm_text);  // caption shows the real answer only
+    }
+    sendPauseAction(_llm_work_id);  // Stop() on the generator (main_llm.cpp: task_pause)
+    // Unlink melotts so the unrelated text that follows the marker is never spoken; re-linked
+    // from update() a few seconds later.
+    sendLinkAction("unlink", _melotts_work_id, _llm_work_id);
+    _melotts_relink_due_ms = now + 3000;
+    _llm_turn_finished = true;
+    _conversation_char_estimate += _accumulated_llm_text.size();
+    // The unit sends finish:true after a pause (seen in the helper log), so the helper reports
+    // real completion; arm the fallback anyway, from now.
+    _llm_finished_ms = now;
+    _estimated_speech_ms = 90000;
+}
+
 void OfflineAgentModule::handleLlmRunaway()
 {
     _runaway_handled = true;
     uint32_t now = esp_timer_get_time() / 1000;
-    mclog::tagError(_tag, "Runaway answer: it is repeating itself after {} chars - stopping the LLM, "
-                          "silencing speech, and resetting context on the next turn",
+    mclog::tagError(_tag, "Runaway answer: it is repeating itself after {} chars - stopping the LLM "
+                          "and silencing speech",
                     _accumulated_llm_text.size());
     // "pause" calls Stop() on the generator (main_llm.cpp: task_pause). The unit has no resume
     // action, so it is expected to accept the next inference normally - UNVERIFIED on hardware.
@@ -1264,7 +1420,10 @@ void OfflineAgentModule::handleLlmRunaway()
     _llm_turn_finished = true;
     _conversation_char_estimate += _accumulated_llm_text.size();
     _accumulated_llm_text.clear();   // the next turn must not build a "hint" from garbage
-    _force_reset_next_turn = true;
+    // Deliberately NO forced context reset here (an earlier version asked for one): the unit appears
+    // to treat every turn independently (no overflow in a ~3,200-token session, no recall of a name
+    // given one turn earlier), and in that mode "reset" is just another user message that the model
+    // would answer - a wasted generation that delays the real next turn.
     // No finish:true is guaranteed to follow a stopped generation, so arm the fallback by hand:
     // follow-up opens once the already-queued speech has had time to play out (or sooner, if the
     // helper reports completion).

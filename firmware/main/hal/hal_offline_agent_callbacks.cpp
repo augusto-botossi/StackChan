@@ -6,6 +6,8 @@
 #include <fmt/format.h>
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <vector>
 #include <apps/common/common.h>
 #include <assets/assets.h>
 
@@ -44,39 +46,52 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
 
         std::string augmented = asr_text;
 
-        // Confirmed real: "tell me our position" and "give our current coordinates" matched
-        // none of the old keywords (where/location/gps), so no GPS reading was attached and
-        // the model invented an address. Broader lists below; a stray match (e.g. "peer
-        // pressure") just attaches a reading the model ignores.
+        // PROMPT LENGTH IS THE CRITICAL CONSTRAINT. The model's prefill window is 128 tokens, system
+        // prompt included, and a longer prompt makes it derail from the very first token (measured:
+        // 40 of 40 derailments at 131-133 tokens, 0 of 10 at 127). Qwen also spends one token per
+        // digit, so a reading is expensive. Therefore: attach ONLY what was asked about, in short
+        // plain sentences (no square brackets, no units glued to numbers). The module trims anything
+        // that still does not fit.
         auto contains_any = [&lower](std::initializer_list<const char*> words) {
             for (const char* w : words) {
                 if (lower.find(w) != std::string::npos) return true;
             }
             return false;
         };
-        bool wants_location = contains_any({"where am", "where are", "where is", "location", "gps", "position", "coordinates",
-                                            "latitude", "longitude", "altitude", "elevation",
+
+        // ---- position (latitude/longitude; altitude and speed only if asked) ----
+        // "position"/"coordinates" were once missing here and the model invented an address;
+        // a bare "where" matched unrelated speech ("...in space where Saturn formed").
+        bool wants_location = contains_any({"where am", "where are", "where is", "location", "gps", "position",
+                                            "coordinates", "latitude", "longitude", "altitude", "elevation",
                                             "how high", "located"});
-        bool wants_environment = contains_any({"temperature", "weather", "humidity", "air quality",
-                                               "pressure", "carbon dioxide", "co2", "how hot",
-                                               "how cold"});
+        bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea"});
+        bool wants_speed = contains_any({"speed", "how fast", "moving"});
+
+        // ---- environment (only the readings that were asked for) ----
+        bool wants_weather = contains_any({"weather", "conditions"});
+        bool wants_temp = wants_weather || contains_any({"temperature", "how hot", "how cold"});
+        bool wants_humidity = wants_weather || contains_any({"humidity", "humid"});
+        bool wants_pressure = wants_weather || contains_any({"pressure"});
+        bool wants_air = contains_any({"air quality", "how is the air", "carbon dioxide", "co2", "breathe"});
+        bool wants_environment = wants_temp || wants_humidity || wants_pressure || wants_air;
 
         if (wants_location && GetHAL().getGps()) {
             auto fix = GetHAL().getGps()->getLastFix();
             if (fix.valid) {
-                // Natural-language phrasing, like the environment reading: the dense
-                // "latitude 50.257415, longitude 8.642969, altitude 201.4m ..." form was
-                // IGNORED by the model ("I do not yet have the current location
-                // information") although it was attached, while the spelled-out
-                // environment reading is read back correctly. 4 decimals (~11 m) is
-                // plenty for speech.
-                augmented += fmt::format(
-                    " Current position: latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}, "
-                    "altitude is {:.0f} meters above sea level, speed is {:.1f} kilometers per hour, "
-                    "and {} satellites are in view.",
-                    std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
-                    std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west",
-                    fix.altitudeM, fix.speedKmh, fix.satellites);
+                // Spelled-out words: the dense "latitude 50.257415, longitude 8.642969, altitude
+                // 201.4m" form was ignored by the model even though it was attached. 4 decimals
+                // (~11 m) is plenty for speech.
+                std::string pos = fmt::format("latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}",
+                                              std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
+                                              std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west");
+                if (wants_altitude) {
+                    pos += fmt::format(", altitude is {:.0f} meters above sea level", fix.altitudeM);
+                }
+                if (wants_speed) {
+                    pos += fmt::format(", speed is {:.1f} kilometers per hour", fix.speedKmh);
+                }
+                augmented += " Current position: " + pos + ".";
             } else {
                 augmented += " No GPS fix is currently available.";
             }
@@ -85,27 +100,29 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         if (wants_environment && GetHAL().getEnvSensor()) {
             auto r = GetHAL().getEnvSensor()->getLastReading();
             if (r.ok) {
-                // Includes IAQ/CO2 now too - the original only had
-                // temperature/humidity/pressure, meaning an air-quality
-                // question got the keyword trigger right but no actual
-                // air-quality data. "lower is better" note included since,
-                // unlike temperature/humidity/pressure, IAQ's scale isn't
-                // self-explanatory - lets the LLM give a genuine verdict
-                // itself rather than us hardcoding our own good/bad
-                // thresholds (risking getting BSEC's own categorization wrong).
-                // Natural-language phrasing (spelled-out words, no
-                // glued units like "24.9C", no nested parentheticals,
-                // no slash notation like "0/3") - tried after a real
-                // regression, though the evidence is mixed: an earlier
-                // log showed this exact same dense/glued format working
-                // fine when NOT near a reset, suggesting post-reset
-                // context fragility is the more likely root cause, not
-                // this formatting itself. Low-risk to try regardless.
-                augmented += fmt::format(
-                    " Current conditions: temperature is {:.1f} degrees Celsius, humidity is {:.0f} percent, "
-                    "pressure is {:.0f} hectopascals, air quality index is {:.0f} out of 500 where lower is "
-                    "better, carbon dioxide level is about {:.0f} parts per million.",
-                    r.temperatureC, r.humidityPct, r.pressureHpa, r.iaq, r.co2EquivalentPpm);
+                std::vector<std::string> parts;
+                if (wants_temp) {
+                    parts.push_back(fmt::format("temperature is {:.1f} degrees Celsius", r.temperatureC));
+                }
+                if (wants_humidity) {
+                    parts.push_back(fmt::format("humidity is {:.0f} percent", r.humidityPct));
+                }
+                if (wants_pressure) {
+                    parts.push_back(fmt::format("pressure is {:.0f} hectopascals", r.pressureHpa));
+                }
+                if (wants_air) {
+                    // "where lower is better": the IAQ scale is not self-explanatory, and this lets
+                    // the model give a verdict itself instead of us hardcoding thresholds.
+                    parts.push_back(fmt::format("air quality index is {:.0f} out of 500 where lower is better", r.iaq));
+                    parts.push_back(fmt::format("carbon dioxide level is about {:.0f} parts per million",
+                                                r.co2EquivalentPpm));
+                }
+                std::string joined;
+                for (const auto& part : parts) {
+                    if (!joined.empty()) joined += ", ";
+                    joined += part;
+                }
+                augmented += " Current conditions: " + joined + ".";
             } else {
                 augmented += " No environment sensor reading is currently available.";
             }
