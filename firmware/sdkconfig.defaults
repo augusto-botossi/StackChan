@@ -78,3 +78,7 @@ CONFIG_LV_USE_SNAPSHOT=y
 CONFIG_LV_USE_IMGFONT=y
 CONFIG_LV_BUILD_EXAMPLES=n
 CONFIG_LV_BUILD_DEMOS=n
+# Becky / Module LLM link: UART0 must stay free, and heap poisoning must stay off
+# (comprehensive poisoning cost ~21 KB of internal RAM and silently stopped the wake-word task).
+CONFIG_HEAP_POISONING_DISABLED=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
