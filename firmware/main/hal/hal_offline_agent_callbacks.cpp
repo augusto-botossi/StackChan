@@ -5,6 +5,7 @@
 #include <mooncake_log.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -12,6 +13,51 @@
 #include <assets/assets.h>
 
 static const std::string_view _tag = "HAL-OfflineAgent";
+
+// ---- name memory ----
+// The model has no memory between turns, so the firmware keeps the user's name and attaches
+// "The user is <name>." (about 6 estimated tokens) to every later question. Kept in RAM only: it
+// is forgotten at reboot, or on "forget my name". The sentence goes in FRONT of the sensor
+// sentences on purpose: when a prompt is too long the module trims the attachment from the end,
+// so a reading is dropped before the name is.
+static std::string g_user_name;
+
+// Looks for "my name is X" / "call me X" and returns X as a single capitalised word, or "".
+// Deliberately NOT "I am X" / "I'm X": that matches "I'm hungry" and would store "Hungry".
+static std::string extract_spoken_name(const std::string& text)
+{
+    std::string lower = text;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    static const char* const kMarkers[] = {"my name is ", "my name's ", "call me "};
+    for (const char* marker : kMarkers) {
+        size_t at = lower.find(marker);
+        if (at == std::string::npos) continue;
+        size_t i = at + std::string(marker).size();
+        std::string word;
+        while (i < text.size() && std::isalpha(static_cast<unsigned char>(text[i]))) {
+            word.push_back(text[i++]);
+        }
+        if (word.size() < 2 || word.size() > 20) continue;
+        // A name with an accent or other non-ASCII letter would be cut short ("Zoë" -> "Zo"): skip it.
+        if (i < text.size() && static_cast<unsigned char>(text[i]) >= 0x80) continue;
+        std::string w = word;
+        std::transform(w.begin(), w.end(), w.begin(), ::tolower);
+        // Words that follow the marker without being a name ("call me back", "my name is not ...").
+        static const char* const kNotNames[] = {"a",   "an",   "the",  "not",   "back", "later", "when",
+                                                "if",  "again", "now", "please", "maybe", "also"};
+        bool rejected = false;
+        for (const char* bad : kNotNames) {
+            if (w == bad) rejected = true;
+        }
+        if (rejected) continue;
+        word[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(word[0])));
+        for (size_t k = 1; k < word.size(); ++k) {
+            word[k] = static_cast<char>(std::tolower(static_cast<unsigned char>(word[k])));
+        }
+        return word;
+    }
+    return "";
+}
 
 void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
 {
@@ -45,6 +91,20 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
         std::string augmented = asr_text;
+
+        // ---- name memory (see extract_spoken_name) ----
+        if (lower.find("forget my name") != std::string::npos) {
+            g_user_name.clear();
+        } else {
+            std::string spoken = extract_spoken_name(asr_text);
+            if (!spoken.empty() && spoken != g_user_name) {
+                g_user_name = spoken;
+                mclog::tagInfo(_tag, "Remembering the user's name: {}", g_user_name);
+            }
+        }
+        if (!g_user_name.empty()) {
+            augmented += " The user is " + g_user_name + ".";
+        }
 
         // PROMPT LENGTH IS THE CRITICAL CONSTRAINT. The model's prefill window is 128 tokens, system
         // prompt included, and a longer prompt makes it derail from the very first token (measured:
