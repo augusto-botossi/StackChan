@@ -11,16 +11,40 @@
 #include <vector>
 #include <apps/common/common.h>
 #include <assets/assets.h>
+#include <settings.h>
 
 static const std::string_view _tag = "HAL-OfflineAgent";
 
 // ---- name memory ----
 // The model has no memory between turns, so the firmware keeps the user's name and attaches
-// "The user is <name>." (about 6 estimated tokens) to every later question. Kept in RAM only: it
-// is forgotten at reboot, or on "forget my name". The sentence goes in FRONT of the sensor
-// sentences on purpose: when a prompt is too long the module trims the attachment from the end,
-// so a reading is dropped before the name is.
+// "The user is <name>." (about 6 estimated tokens) to every later question. The name is saved in
+// flash (NVS namespace "becky", key "user_name") so it survives a reboot; it is forgotten on "forget
+// my name". The sentence goes in FRONT of the sensor sentences on purpose: when a prompt is too long
+// the module trims the attachment from the end, so a reading is dropped before the name is.
 static std::string g_user_name;
+static bool g_user_name_loaded = false;
+
+static constexpr const char* kNameNvsNamespace = "becky";
+static constexpr const char* kNameNvsKey = "user_name";
+
+static void load_user_name_once()
+{
+    if (g_user_name_loaded) return;
+    g_user_name_loaded = true;
+    Settings settings(kNameNvsNamespace, false);  // read-only: no namespace yet simply gives ""
+    g_user_name = settings.GetString(kNameNvsKey, "");
+    if (!g_user_name.empty()) {
+        mclog::tagInfo(_tag, "Restored the user's name from flash: {}", g_user_name);
+    }
+}
+
+// An empty name is stored as "" rather than erased: Settings::EraseKey() does not mark the handle
+// dirty, so the erase would never be committed.
+static void save_user_name(const std::string& name)
+{
+    Settings settings(kNameNvsNamespace, true);
+    settings.SetString(kNameNvsKey, name);
+}
 
 // Looks for "my name is X" / "call me X" and returns X as a single capitalised word, or "".
 // Deliberately NOT "I am X" / "I'm X": that matches "I'm hungry" and would store "Hungry".
@@ -93,12 +117,18 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         std::string augmented = asr_text;
 
         // ---- name memory (see extract_spoken_name) ----
+        load_user_name_once();
         if (lower.find("forget my name") != std::string::npos) {
-            g_user_name.clear();
+            if (!g_user_name.empty()) {
+                g_user_name.clear();
+                save_user_name(g_user_name);
+                mclog::tagInfo(_tag, "Forgot the user's name");
+            }
         } else {
             std::string spoken = extract_spoken_name(asr_text);
             if (!spoken.empty() && spoken != g_user_name) {
                 g_user_name = spoken;
+                save_user_name(g_user_name);  // only when it changed: spares the flash
                 mclog::tagInfo(_tag, "Remembering the user's name: {}", g_user_name);
             }
         }
