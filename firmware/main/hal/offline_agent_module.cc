@@ -43,6 +43,12 @@ static constexpr uint32_t kSetupTimeoutMs = 90000;
 // follow-up than a short one does - not a timing/estimate bug.
 static constexpr uint32_t kFollowUpWindowMs = 20000;
 
+// If the user is speaking when kFollowUpWindowMs runs out (VAD ACTIVE), the window stays open until
+// they stop, then a little longer for whisper to return the transcript - but never longer than this
+// overrun in total, in case VAD gets stuck on ACTIVE.
+static constexpr uint32_t kFollowUpSpeechOverrunMs = 15000;
+static constexpr uint32_t kFollowUpAsrGraceMs = 3000;
+
 // Brief buffer between "estimated speech duration elapsed" and actually
 // re-arming vad/whisper - see the usage site in update() for the full
 // reasoning (confirmed acoustic echo/tail from Becky's own speaker).
@@ -235,9 +241,30 @@ void OfflineAgentModule::sendLinkAction(const std::string& action, const std::st
 void OfflineAgentModule::startFollowUpWindow()
 {
     _followup_started_ms = esp_timer_get_time() / 1000;
+    _vad_active = false;  // a stale ACTIVE from before the window must not hold it open
+    _vad_changed_ms = 0;
+    _followup_hold_logged = false;
     sendWorkAction(_vad_work_id);
     sendWorkAction(_asr_work_id);
     mclog::tagInfo(_tag, "Follow-up window started - listening without wake word");
+}
+
+// True when the follow-up window may close now. Before kFollowUpWindowMs: never (the callers handle
+// that). After it: only if the user is not speaking and has not just stopped (whisper needs a moment
+// to return the transcript), or once the overrun budget is used up.
+bool OfflineAgentModule::followUpMayClose(uint32_t elapsed_ms)
+{
+    if (elapsed_ms < kFollowUpWindowMs) return false;
+    if (elapsed_ms >= kFollowUpWindowMs + kFollowUpSpeechOverrunMs) return true;
+    const uint32_t now = esp_timer_get_time() / 1000;
+    const bool speaking = _vad_active || (now - _vad_changed_ms) < kFollowUpAsrGraceMs;
+    if (speaking && !_followup_hold_logged) {
+        _followup_hold_logged = true;
+        mclog::tagInfo(_tag, "Follow-up window reached its limit ({}ms) while speech is in progress - "
+                             "keeping it open until the speaker finishes",
+                       elapsed_ms);
+    }
+    return !speaking;
 }
 
 void OfflineAgentModule::endFollowUpWindow()
@@ -779,7 +806,7 @@ void OfflineAgentModule::update()
     if (_state == State::FollowUp) {
         uint32_t fresh_now = esp_timer_get_time() / 1000;
         uint32_t elapsed = fresh_now - _followup_started_ms;
-        if (elapsed >= kFollowUpWindowMs) {
+        if (followUpMayClose(elapsed)) {
             mclog::tagInfo(_tag, "Follow-up window timed out ({}ms) - no utterance detected, back to idle", elapsed);
             endFollowUpWindow();
             setState(State::Idle);
@@ -844,6 +871,8 @@ void OfflineAgentModule::handleKwsWake(bool detected)
 
 void OfflineAgentModule::handleVadState(bool speechActive)
 {
+    _vad_active = speechActive;
+    _vad_changed_ms = esp_timer_get_time() / 1000;
     // Temporary diagnostic: testing whether Module LLM's mic picks up
     // Becky's OWN speaker output as speech activity (a classic acoustic
     // self-hearing/echo issue) - if a long response's duration estimate
@@ -1073,6 +1102,9 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
                 sendWorkAction(_asr_work_id);
                 return;  // stay in FollowUp, keep listening
             }
+            // Past the limit but the user is mid-sentence: no re-arm (it would cut the utterance),
+            // just keep waiting - the transcript arrives by itself when they stop.
+            if (!followUpMayClose(elapsed)) return;
             endFollowUpWindow();
         }
         setState(State::Idle);

@@ -189,6 +189,14 @@ private:
     void endFollowUpWindow();
     uint32_t _followup_started_ms = 0;
 
+    // The follow-up window must not close while the user is in the middle of a sentence (seen in a
+    // real log: VAD turned ACTIVE 0.6 s before the 20 s limit and the window closed anyway, so the
+    // question was never transcribed). followUpMayClose() is the one place that decides.
+    bool followUpMayClose(uint32_t elapsed_ms);
+    bool _vad_active = false;          // last state VAD reported (reset when a window opens)
+    uint32_t _vad_changed_ms = 0;      // when VAD last changed state
+    bool _followup_hold_logged = false;  // log "keeping the window open" once per window
+
     bool _finish_queued = false;  // guards against melotts's duplicate finish signal (confirmed via testing: it sends finished:true twice)
 
     // Text-length-based estimate for when melotts's local playback (via
