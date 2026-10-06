@@ -109,6 +109,13 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
             hal_bridge::restore_idle_motion();
             hal_bridge::clear_chat_messages();
         }
+        // set_display_status() above ends in StackChanAvatarDisplay::SetStatus(), which sets the
+        // "xiaozhi idle" flag to false for every status except STANDBY - and the avatar update task
+        // (_stackchan_update_task in hal.cpp) waits an extra 100 ms per cycle while that flag is false.
+        // Becky never reports STANDBY, so after the first wake word the idle movement ran at ~8 updates
+        // per second instead of ~50 and looked choppy next to the AI Assistant. The offline app has no
+        // network/audio load on this CPU that the throttle was meant to protect, so keep it off.
+        hal_bridge::set_xiaozhi_idle(true);
     });
 
     agent->onSpeechText([](const std::string& text) {
