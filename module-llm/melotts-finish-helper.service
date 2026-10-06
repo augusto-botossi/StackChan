@@ -1,0 +1,15 @@
+[Unit]
+Description=Becky melotts finish helper (tells the CoreS3 when speech has really finished)
+After=network.target
+# Never give up restarting (this key belongs in [Unit]; in [Service] systemd ignores it with a warning).
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/opt/melotts_finish_helper_v2
+# The helper exits when the CoreS3 app has not set up its llm / melotts tasks yet, and when the app
+# re-creates them (new llm work_id). Restarting it every few seconds is the intended behaviour.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

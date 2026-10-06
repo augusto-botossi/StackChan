@@ -24,7 +24,33 @@ gcc /opt/melotts_finish_helper_v2.c -lzmq -o /opt/melotts_finish_helper_v2
 ```
 
 Check there is exactly ONE process: `ps aux | grep melotts_finish_helper | grep -v grep`.
-Needs `libzmq3-dev`. Not persistent: start it again after a Module LLM reboot.
+Needs `libzmq3-dev`.
+
+### Start it automatically on every boot (systemd)
+
+Started by hand, the helper is gone after a Module LLM reboot, and then the CoreS3 only leaves
+"Speaking" when its 90-second fallback timer fires (seen in a real log: 90.8 s, versus 6.6 s with the
+helper running). Install it as a service instead:
+
+```sh
+# on the PC
+adb push module-llm/melotts_finish_helper_v2.c        /opt/
+adb push module-llm/melotts-finish-helper.service     /opt/
+adb push module-llm/install_finish_helper_service.sh  /opt/
+adb shell sh /opt/install_finish_helper_service.sh
+```
+
+The script compiles the helper, stops any copy started by hand (two copies would both send a finish
+message), and enables `melotts-finish-helper.service`. After that:
+
+- `journalctl -u melotts-finish-helper -f` shows its output (replaces the terminal you used to start it).
+- `systemctl status melotts-finish-helper` shows whether it is running.
+- It is normal to see "Could not discover melotts's work_id" repeating every 5 s while the CoreS3
+  app has not started yet: the helper exits and systemd starts it again until the tasks exist.
+- The helper survives a CoreS3-only restart: the app re-creates its tasks (llm.1003 -> llm.1008,
+  melotts.1004 -> melotts.1009 in a real log), the helper prints "melotts's work_id changed" and
+  keeps working, because the llm output stream it listens to stays the same.
+- To update the helper later: push the new `.c`, run `sh /opt/install_finish_helper_service.sh` again.
 
 ## probes/ (Python, run on the Module LLM)
 
