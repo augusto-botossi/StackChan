@@ -1131,18 +1131,26 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
     // makes it derail from the first token. The callback keeps its attachments short, this is the
     // safety net: trim the attachment (last sentence first), then the oldest words.
     {
+        // The callback may put a short sentence IN FRONT of the spoken words (the remembered name) and
+        // sensor sentences after them: prefix + text + extra. The prefix is never trimmed here; the
+        // attachment goes first, then the oldest words of the question itself.
+        std::string prefix;
         std::string base = text;
         std::string extra;
-        if (augmented.size() >= text.size() && augmented.compare(0, text.size(), text) == 0) {
-            extra = augmented.substr(text.size());
+        const size_t at = text.empty() ? std::string::npos : augmented.find(text);
+        if (at != std::string::npos) {
+            prefix = augmented.substr(0, at);
+            extra = augmented.substr(at + text.size());
         } else {
             base = augmented;
         }
         const size_t budget = prompt_user_token_budget();
-        const size_t wanted = estimate_tokens(base + extra);
+        const size_t wanted = estimate_tokens(prefix + base + extra);
         mclog::tagInfo(_tag, "Prompt size: about {} of {} user tokens", wanted, budget);
         if (wanted > budget) {
-            augmented = fit_to_budget(base, extra, budget);
+            const size_t prefix_tokens = estimate_tokens(prefix);
+            const size_t body_budget = budget > prefix_tokens + 8 ? budget - prefix_tokens : 8;
+            augmented = prefix + fit_to_budget(base, extra, body_budget);
             mclog::tagInfo(_tag, "Prompt too long for the model's 128-token window - trimmed to about {} tokens",
                            estimate_tokens(augmented));
         }

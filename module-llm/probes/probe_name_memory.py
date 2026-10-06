@@ -16,6 +16,12 @@ and measures:
     adb push probe_name_memory.py /opt/       (next to probe_prompt_derail.py)
     nohup python3 -u /opt/probe_name_memory.py > /opt/name_memory.log 2>&1 &
     python3 /opt/probe_name_memory.py --trials 6
+    python3 /opt/probe_name_memory.py --wordings --trials 8     # compare ways of attaching the name
+    python3 /opt/probe_name_memory.py --sensors --trials 8      # does the name in front hurt sensor answers?
+
+A real log showed the firmware's current wording ("What is my name?. The user is Augusto.") makes
+Becky greet instead of answer ("Hello, Augusto! How can I assist you today?"). --wordings sends the
+name questions in several wordings and counts how many answers actually say the name.
 
 Leave the Offline Agent app (CoreS3 launcher) before running; restart it afterwards.
 """
@@ -82,6 +88,19 @@ CASES = {
 }
 
 
+# Ways of attaching the name to a question. The first one is what the firmware sends today; the others
+# put the name FIRST (that needs a change in how the module builds the prompt, see fit_to_budget()).
+WORDINGS = {
+    "after: The user is X.":        lambda q: f" {q} The user is {NAME}.",
+    "after: The user's name is X.": lambda q: f" {q} The user's name is {NAME}.",
+    "before: The user is X.":       lambda q: f" The user is {NAME}. {q}",
+    "before: The user's name is X": lambda q: f" The user's name is {NAME}. {q}",
+    "before: My name is X.":        lambda q: f" My name is {NAME}. {q}",
+}
+NAME_QUESTIONS = ["What is my name?.", "Do you remember my name?.", "Can you tell me my name please?.",
+                  "Hello Becky, how are you?."]
+
+
 def classify(answer, proofs, kind):
     head = answer[:240]
     if not head.strip():
@@ -98,10 +117,105 @@ def classify(answer, proofs, kind):
     return "other"
 
 
+def compare_wordings(trials):
+    client = P.Client()
+    print("Cleaning up any existing llm task...")
+    P.cleanup(client, ["llm"])
+    P.SETUP_DATA = {**P.SETUP_DATA, "prompt": SYS_HINT}
+    work_id = P.setup_and_wait(client)
+    print(f"   llm task: {work_id}\n")
+    budget = user_token_budget(SYS_HINT)
+    results = {}   # (wording, question) -> [(verdict, answer)]
+    for trial in range(1, trials + 1):
+        for wname, build in WORDINGS.items():
+            for q in NAME_QUESTIONS:
+                prompt = build(q)
+                if estimate_tokens(prompt) > budget:
+                    print(f"  (skipped, {estimate_tokens(prompt)} > {budget} tokens: {prompt!r})")
+                    continue
+                answer, *_ = P.run_trial(client, work_id, prompt, 240)
+                verdict = classify(answer, [NAME.lower()], "name")
+                results.setdefault((wname, q), []).append((verdict, answer))
+                print(f"[{trial:>2}/{trials}] {wname:<30} {q[:30]:<30} {verdict:<8} | {answer[:60]!r}")
+    client.send({"request_id": P.new_request_id(), "work_id": work_id, "action": "exit"})
+    client.read_one(timeout=5.0)
+
+    print("\n" + "=" * 92)
+    print('SUMMARY  (ok = the answer contains the name; for "How are you?" that means she used it, which is optional)')
+    print("=" * 92)
+    for wname in WORDINGS:
+        print(f"\n{wname}")
+        for q in NAME_QUESTIONS:
+            lst = results.get((wname, q), [])
+            vs = [v for v, _ in lst]
+            if vs:
+                print(f"    {q[:34]:<36} ok {vs.count('ok')}/{len(vs)}   derail {vs.count('derail')}")
+        bad = [(q, a) for q in NAME_QUESTIONS for v, a in results.get((wname, q), []) if v != "ok"][:2]
+        for q, a in bad:
+            print(f"      e.g. {q[:24]!r}: {a[:90]!r}")
+    print("\nDone. Restart the Offline Agent app on the CoreS3.")
+
+
+# The name sentence FIRST, then the question, then the sensor sentence - what the firmware now sends -
+# against no name at all and against the old wording (name after the question, before the reading).
+SENSOR_VARIANTS = {
+    "no name":                lambda q, extra: f" {q}{extra}",
+    "name first (firmware)":  lambda q, extra: f" My name is {NAME}. {q}{extra}",
+    "name after (old)":       lambda q, extra: f" {q} The user is {NAME}.{extra}",
+}
+SENSOR_QUESTIONS = {
+    "weather":  ("What is the weather like today?.", WEATHER, ["21"]),
+    "position": ("Where are we right now?.", POSITION, ["50.25", "8.64"]),
+    "both":     ("What is the weather like and where are we?.", WEATHER + POSITION, ["21", "50.25", "8.64"]),
+}
+
+
+def compare_sensors(trials):
+    client = P.Client()
+    print("Cleaning up any existing llm task...")
+    P.cleanup(client, ["llm"])
+    P.SETUP_DATA = {**P.SETUP_DATA, "prompt": SYS_HINT}
+    work_id = P.setup_and_wait(client)
+    print(f"   llm task: {work_id}\n")
+    budget = user_token_budget(SYS_HINT)
+    results = {}
+    for trial in range(1, trials + 1):
+        for vname, build in SENSOR_VARIANTS.items():
+            for qk, (q, extra, proofs) in SENSOR_QUESTIONS.items():
+                # the firmware trims the attachment (from the end) when the prompt is too long: same here
+                body_budget = budget - (estimate_tokens(f"My name is {NAME}. ") if "first" in vname else 0)
+                fitted = fit_to_budget(q, extra, body_budget)
+                prompt = build(q, fitted[len(q):])
+                answer, *_ = P.run_trial(client, work_id, prompt, 240)
+                verdict = classify(answer, proofs, "reading")
+                results.setdefault((vname, qk), []).append((verdict, answer))
+                print(f"[{trial:>2}/{trials}] {vname:<22} {qk:<9} {verdict:<8} | {answer[:70]!r}")
+    client.send({"request_id": P.new_request_id(), "work_id": work_id, "action": "exit"})
+    client.read_one(timeout=5.0)
+
+    print("\n" + "=" * 92)
+    print("SUMMARY  (ok = the answer contains the reading; for 'both', position was trimmed away by the budget)")
+    print("=" * 92)
+    for vname in SENSOR_VARIANTS:
+        print(f"\n{vname}")
+        for qk in SENSOR_QUESTIONS:
+            vs = [v for v, _ in results.get((vname, qk), [])]
+            contr = sum(1 for _, a in results.get((vname, qk), []) if CONTRACTION.search(a[:240]))
+            print(f"    {qk:<10} ok {vs.count('ok')}/{len(vs)}   derail {vs.count('derail')}   "
+                  f"refused {vs.count('refused')}   other {vs.count('other')}   contractions {contr}/{len(vs)}")
+    print("\nDone. Restart the Offline Agent app on the CoreS3.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trials", type=int, default=6)
+    ap.add_argument("--wordings", action="store_true", help="compare ways of attaching the name instead")
+    ap.add_argument("--sensors", action="store_true", help="check sensor answers with the name in front")
     args = ap.parse_args()
+    if args.wordings:
+        return compare_wordings(args.trials)
+    if args.sensors:
+        return compare_sensors(args.trials)
 
     budget = user_token_budget(SYS_HINT)
     print(f"System prompt ~{estimate_tokens(SYS_HINT)} tokens; user budget {budget} (limit {PROMPT_TOKEN_LIMIT})\n")

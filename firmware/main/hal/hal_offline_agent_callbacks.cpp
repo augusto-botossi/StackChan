@@ -17,10 +17,15 @@ static const std::string_view _tag = "HAL-OfflineAgent";
 
 // ---- name memory ----
 // The model has no memory between turns, so the firmware keeps the user's name and attaches
-// "The user is <name>." (about 6 estimated tokens) to every later question. The name is saved in
-// flash (NVS namespace "becky", key "user_name") so it survives a reboot; it is forgotten on "forget
-// my name". The sentence goes in FRONT of the sensor sentences on purpose: when a prompt is too long
-// the module trims the attachment from the end, so a reading is dropped before the name is.
+// "My name is <name>." (about 6 estimated tokens) IN FRONT of every later question. The name is
+// saved in flash (NVS namespace "becky", key "user_name") so it survives a reboot; it is forgotten
+// on "forget my name".
+// Wording and position were measured (probe_name_memory.py --wordings, 8 trials each) on "What is my
+// name?": "My name is X." before the question answered it 8 of 8 times; "The user is X." after the
+// question (the first version) only 2 of 8 - the rest were greetings ("Hello, Augusto! How can I
+// assist you today?"); "The user's name is X." scored 0 of 8 either way. Written as the user's own
+// words the model answers "Your name is X.". The module trims sensor sentences before it touches
+// this prefix (see handleAsrResult()).
 static std::string g_user_name;
 static bool g_user_name_loaded = false;
 
@@ -117,6 +122,7 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         std::string augmented = asr_text;
 
         // ---- name memory (see extract_spoken_name) ----
+        std::string name_prefix;  // goes in FRONT of the question, see the comment above g_user_name
         load_user_name_once();
         if (lower.find("forget my name") != std::string::npos) {
             if (!g_user_name.empty()) {
@@ -132,8 +138,13 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                 mclog::tagInfo(_tag, "Remembering the user's name: {}", g_user_name);
             }
         }
-        if (!g_user_name.empty()) {
-            augmented += " The user is " + g_user_name + ".";
+        // Not when the user is introducing themselves right now: the question already says it.
+        const bool introducing = !extract_spoken_name(asr_text).empty();
+        if (!g_user_name.empty() && !introducing) {
+            // The ASR text normally starts with a space already: add one only if it does not, so the
+            // prompt keeps the single-space shape the probe measured.
+            name_prefix = "My name is " + g_user_name + ".";
+            if (asr_text.empty() || asr_text[0] != ' ') name_prefix += " ";
         }
 
         // PROMPT LENGTH IS THE CRITICAL CONSTRAINT. The model's prefill window is 128 tokens, system
@@ -218,7 +229,7 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
             }
         }
 
-        return augmented;
+        return name_prefix + augmented;
     });
 }
 
