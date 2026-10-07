@@ -17,7 +17,9 @@ static const std::string_view _tag = "HAL-OfflineAgent";
 
 // ---- name memory ----
 // The model has no memory between turns, so the firmware keeps the user's name and attaches
-// "My name is <name>." (about 6 estimated tokens) IN FRONT of every later question. The name is
+// "My name is <name>." (about 6 estimated tokens) in front of a question ABOUT the name ("what is my
+// name", "who am I"...), not of every question: attached to all of them it made her greet the user
+// ("Hello Augusto!") in nearly every answer. The name is
 // saved in flash (NVS namespace "becky", key "user_name") so it survives a reboot; it is forgotten
 // on "forget my name".
 // Wording and position were measured (probe_name_memory.py --wordings, 8 trials each) on "What is my
@@ -147,7 +149,16 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         }
         // Not when the user is introducing themselves right now: the question already says it.
         const bool introducing = !extract_spoken_name(asr_text).empty();
-        if (!g_user_name.empty() && !introducing) {
+        // And only when the question is about the name itself (see the comment above g_user_name).
+        bool asks_name = false;
+        for (const char* phrase : {"my name", "who am i", "who i am", "know me", "remember me", "call me",
+                                   "what am i called"}) {
+            if (lower.find(phrase) != std::string::npos) {
+                asks_name = true;
+                break;
+            }
+        }
+        if (!g_user_name.empty() && !introducing && asks_name) {
             // The ASR text normally starts with a space already: add one only if it does not, so the
             // prompt keeps the single-space shape the probe measured.
             name_prefix = "My name is " + g_user_name + ".";
@@ -173,12 +184,18 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         bool wants_location = contains_any({"where am", "where are", "where is", "location", "gps", "position",
                                             "coordinates", "latitude", "longitude", "altitude", "elevation",
                                             "how high", "located"});
-        bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea"});
+        // "height" counts too ("how high we are" was once heard as "tell me or height"), except when it is
+        // about Becky herself.
+        bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea", "height"}) &&
+                              !contains_any({"your height", "how tall"});
+        wants_location = wants_location || wants_altitude;
         bool wants_speed = contains_any({"speed", "how fast", "moving"});
 
         // ---- environment (only the readings that were asked for) ----
         bool wants_weather = contains_any({"weather", "conditions"});
-        bool wants_temp = wants_weather || contains_any({"temperature", "how hot", "how cold"});
+        // "is it too hot?" used to get no reading at all and the model answered without data.
+        bool wants_temp = wants_weather || contains_any({"temperature", "how hot", "how cold", "how warm", "too hot",
+                                                          "too cold", "is it hot", "is it cold", "is it warm"});
         bool wants_humidity = wants_weather || contains_any({"humidity", "humid"});
         bool wants_pressure = wants_weather || contains_any({"pressure"});
         bool wants_air = contains_any({"air quality", "how is the air", "carbon dioxide", "co2", "breathe"});
@@ -193,13 +210,16 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                 std::string pos = fmt::format("latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}",
                                               std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
                                               std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west");
-                if (wants_altitude) {
-                    pos += fmt::format(", altitude is {:.0f} meters above sea level", fix.altitudeM);
-                }
                 if (wants_speed) {
                     pos += fmt::format(", speed is {:.1f} kilometers per hour", fix.speedKmh);
                 }
                 augmented += " Current position: " + pos + ".";
+                if (wants_altitude) {
+                    // A separate sentence that says what "height" means here: "how high we are" was once
+                    // answered as if it were about Becky's own height.
+                    augmented += fmt::format(" Our altitude, our height above sea level, is {:.0f} meters.",
+                                             fix.altitudeM);
+                }
             } else {
                 augmented += " No GPS fix is currently available.";
             }

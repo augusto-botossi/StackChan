@@ -122,7 +122,7 @@ void OfflineAgentModule::setState(State newState)
 // baseline for _conversation_char_estimate) - kept as one definition so
 // they can never silently drift apart.
 //
-// KEEP THIS SHORT. The model's prefill window is 128 tokens and this prompt (plus ~13 tokens of chat
+// KEEP THIS SHORT. The model's prefill window is kModelPrefillWindow tokens (256 with the p256 model; it was 128 with Int4) and this prompt (plus ~13 tokens of chat
 // template) comes out of it on EVERY turn - what is left is all the room the user's words and any
 // sensor/GPS reading get. The previous version (about 47 tokens with the contraction examples) left
 // room for only ~73 user tokens, which a name plus a full sensor sentence overran. See
@@ -136,6 +136,17 @@ static const std::string kSystemPrompt =
     "Do not use contractions. "
     "Answer in at most three short sentences unless asked for more. "
     "You have sensors; use the readings given with a question.";
+
+// The language model on the Module LLM and the size of its prefill window (how many prompt tokens it
+// can take in at once; system prompt and chat template included). Measured with
+// module-llm/probes/probe_prompt_length.py, 6 trials per length: the Int4 model (128-token window)
+// answered normally up to 128 tokens and derailed from 129; the p256 model (256-token window) was
+// clean up to 255, had 1 bad answer in 6 at 256, and derailed from 257. The p256 model is slower
+// (first word about 3.6 s against 1.7 s, 3.57 tok/s against 4.63 tok/s) - accepted on purpose for the
+// roomier prompt. To go back: "qwen2.5-1.5B-Int4-ax630c" and a window of 128 (git tag
+// becky-flashed-2026-10-04 is the last build on the Int4 model).
+static const char* const kLlmModel = "qwen2.5-1.5B-p256-ax630c";
+static constexpr size_t kModelPrefillWindow = 256;
 
 static std::string new_request_id()
 {
@@ -586,7 +597,7 @@ bool OfflineAgentModule::setupLlm()
     return do_setup(_impl->uart_num, _impl->rx_buffer, _impl->tx_mutex,
         "llm", "llm.setup",
         [](ArduinoJson::JsonObject data) {
-            data["model"] = "qwen2.5-1.5B-Int4-ax630c";
+            data["model"] = kLlmModel;
             data["response_format"] = "llm.utf-8.stream";
             data["input"] = "llm.utf-8";
             data["enoutput"] = true;
@@ -725,7 +736,7 @@ void OfflineAgentModule::update()
     // LLM stall watchdog: if generation goes silent - no output at all for
     // kLlmStallTimeoutMs - before its finish:true arrives, the stream is dead
     // (e.g. the llm unit crashed or was restarted on Module LLM). Nothing else
-    // would ever end such a turn. Normal gaps are tiny (first token ~1.7s, then
+    // would ever end such a turn. Normal gaps are tiny (first token ~1.7s with Int4, ~3.6s with p256, then
     // ~0.2s per token); even a runaway generation keeps streaming, so it never
     // trips this - it only catches a genuine stall.
     if ((_state == State::Processing || _state == State::Speaking) && !_llm_turn_finished) {
@@ -1023,13 +1034,12 @@ static size_t estimate_tokens(const std::string& s)
 }
 
 // How many estimated tokens the user's words plus anything we attach may take. The whole prompt
-// (system block + chat template + user text) must stay within the model's 128-token prefill window:
-// in a controlled replay, prompts of 131-133 tokens derailed 40 of 40 times (junk from the very
-// first token), while a 127-token version of the same prompt answered correctly 10 of 10.
-// The limit below leaves 8 tokens of headroom under that cliff, on top of the estimator's margin.
+// (system block + chat template + user text) must stay within the model's prefill window (kModelPrefillWindow):
+// just past it the model derails from the very first token (Int4: 129+ of 128, p256: 257+ of 256; see
+// kLlmModel). The limit below leaves 8 tokens of headroom under that cliff, on top of the estimator's margin.
 static size_t prompt_user_token_budget()
 {
-    constexpr size_t kPromptTokenLimit = 120;
+    constexpr size_t kPromptTokenLimit = kModelPrefillWindow - 8;
     static const size_t fixed = estimate_tokens(kSystemPrompt) + 5 /* system header+footer */ +
                                 8 /* user header + assistant header */;
     return kPromptTokenLimit > fixed ? kPromptTokenLimit - fixed : 8;
@@ -1127,7 +1137,7 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
     // caption and logs still reflect what was really said.
     std::string augmented = _prompt_augment_cb ? _prompt_augment_cb(text) : text;
 
-    // PROMPT LENGTH GUARD - see prompt_user_token_budget(): a prompt over the model's 128-token window
+    // PROMPT LENGTH GUARD - see prompt_user_token_budget(): a prompt over the model's prefill window
     // makes it derail from the first token. The callback keeps its attachments short, this is the
     // safety net: trim the attachment (last sentence first), then the oldest words.
     {
@@ -1151,8 +1161,8 @@ void OfflineAgentModule::handleAsrResult(const std::string& text, bool finished)
             const size_t prefix_tokens = estimate_tokens(prefix);
             const size_t body_budget = budget > prefix_tokens + 8 ? budget - prefix_tokens : 8;
             augmented = prefix + fit_to_budget(base, extra, body_budget);
-            mclog::tagInfo(_tag, "Prompt too long for the model's 128-token window - trimmed to about {} tokens",
-                           estimate_tokens(augmented));
+            mclog::tagInfo(_tag, "Prompt too long for the model's {}-token window - trimmed to about {} tokens",
+                           (int)kModelPrefillWindow, estimate_tokens(augmented));
         }
     }
 
