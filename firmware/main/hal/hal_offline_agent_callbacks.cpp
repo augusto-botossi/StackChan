@@ -214,6 +214,11 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                     pos += fmt::format(", speed is {:.1f} kilometers per hour", fix.speedKmh);
                 }
                 augmented += " Current position: " + pos + ".";
+                if (!wants_altitude) {
+                    // Probe_location_wording: without this instruction the model skipped the coordinates in
+                    // 5 of 25 answers (2 of 5 for "how about our current location"); with it, 0 of 25.
+                    augmented += " Tell the user these coordinates.";
+                }
                 if (wants_altitude) {
                     // A separate sentence that says what "height" means here: "how high we are" was once
                     // answered as if it were about Becky's own height.

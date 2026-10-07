@@ -236,16 +236,21 @@ def fmt(x, nd=1):
 
 
 def main():
+    global SETTLE_S
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default=P.SETUP_DATA["model"])
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--only", type=str, default="")
     ap.add_argument("--no-warmup", action="store_true")
+    ap.add_argument("--settle", type=float, default=SETTLE_S,
+                    help="seconds of silence that count as 'the answer is finished' (default 3.5; "
+                         "use 8 for slow models whose pauses between sentences are longer)")
     ap.add_argument("--no-melotts", action="store_true",
                     help="llm only, no speech: tells whether the chained melotts causes a problem")
     ap.add_argument("--audio-log-bin", type=str, default=AUDIO_LOG_BIN)
     args = ap.parse_args()
     keys = [k for k in QUESTIONS if not args.only or k in args.only.lower().split(",")]
+    SETTLE_S = args.settle
 
     if not os.path.exists(args.audio_log_bin):
         raise SystemExit(f"{args.audio_log_bin} not found: push audio_queue_log.c to /opt and compile "
