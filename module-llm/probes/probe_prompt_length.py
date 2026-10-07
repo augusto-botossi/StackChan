@@ -92,13 +92,17 @@ def main():
     print(f"   llm task: {work_id}\n")
 
     results = {t: [] for t in targets}
+    firsts = {t: [] for t in targets}   # seconds from sending the prompt to the first word of the answer
     for trial in range(1, args.trials + 1):
         for t in targets:   # round-robin so slow drift cannot favour one length
             user, n = prompts[t]
             answer, finished, paused, first_s = P.run_trial(client, work_id, user, P.STOP_CHARS_DEFAULT)
             verdict = P.classify(answer, P.WEATHER_WORDS)
             results[t].append((verdict, answer))
-            print(f"[{trial:>2}/{args.trials}] {n:>3} tokens  {verdict:<31} | {answer[:60]!r}")
+            if first_s is not None:
+                firsts[t].append(first_s)
+            ft = f"{first_s:4.1f}s" if first_s is not None else "  -  "
+            print(f"[{trial:>2}/{args.trials}] {n:>3} tokens  first word {ft}  {verdict:<31} | {answer[:60]!r}")
 
     print("\n" + "=" * 90)
     print("SUMMARY - same question, only the total prompt length differs")
@@ -107,7 +111,9 @@ def main():
         n = prompts[t][1]
         bad = sum(1 for v, _ in results[t] if v != "ok")
         bar = "#" * bad + "." * (len(results[t]) - bad)
-        print(f"{n:>4} tokens  {bad}/{len(results[t])} bad  [{bar}]{'   <-- 128' if n == 128 else ('   <-- 256' if n == 256 else '')}")
+        avg = f"{sum(firsts[t]) / len(firsts[t]):4.1f}s" if firsts[t] else "  -  "
+        print(f"{n:>4} tokens  {bad}/{len(results[t])} bad  [{bar}]  first word avg {avg}"
+              f"{'   <-- 128' if n == 128 else ('   <-- 256' if n == 256 else '')}")
     print("\nIf the bad answers start right after the model's window (128, or 256 for the p256 model), "
           "length alone is the cause.")
 
