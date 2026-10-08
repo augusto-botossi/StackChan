@@ -12,6 +12,7 @@
 #include <apps/common/common.h>
 #include <assets/assets.h>
 #include <settings.h>
+#include "board/place_lookup.h"
 
 static const std::string_view _tag = "HAL-OfflineAgent";
 
@@ -214,10 +215,24 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                     pos += fmt::format(", speed is {:.1f} kilometers per hour", fix.speedKmh);
                 }
                 augmented += " Current position: " + pos + ".";
+
+                // Offline town lookup (places.bin, loaded from the SD card at boot). If the card or file
+                // was missing, Loaded() is false and the sentence stays exactly as before.
+                bool have_town = false;
+                PlaceResult place;
+                if (PlaceLookup::Loaded() && PlaceLookup::Nearest(fix.latitude, fix.longitude, place)) {
+                    have_town = true;
+                    if (place.distance_km <= 30.0f) {
+                        augmented += fmt::format(" We are near {}, {}.", place.name, place.country);
+                    } else {
+                        augmented += fmt::format(" The nearest town is {}, {}.", place.name, place.country);
+                    }
+                }
                 if (!wants_altitude) {
                     // Probe_location_wording: without this instruction the model skipped the coordinates in
                     // 5 of 25 answers (2 of 5 for "how about our current location"); with it, 0 of 25.
-                    augmented += " Tell the user these coordinates.";
+                    augmented += have_town ? " Tell the user the town and these coordinates."
+                                           : " Tell the user these coordinates.";
                 }
                 if (wants_altitude) {
                     // A separate sentence that says what "height" means here: "how high we are" was once
