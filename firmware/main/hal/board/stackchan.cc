@@ -20,6 +20,11 @@
 #include "stackchan_camera.h"
 #include "hal_bridge.h"
 
+#include <esp_vfs_fat.h>
+#include <driver/sdspi_host.h>
+#include <sdmmc_cmd.h>
+#include "place_lookup.h"
+
 #define TAG "M5Stack-StackChan-Board"
 
 #define XPOWERS_AXP2101_ICC_CHG_SET (0x62)
@@ -217,6 +222,16 @@ public:
         vTaskDelay(pdMS_TO_TICKS(20));
         WriteReg(0x03, 0b10000011);
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+        // TF card detect: AW9523 P0.4, input register 0x00, low = card inserted
+    bool IsSdCardPresent()
+    {
+        uint8_t v = 0xFF;
+        if (TryReadRegs(0x00, &v, 1) != ESP_OK) {
+            return false;
+        }
+        return ((v >> 4) & 1) == 0;
     }
 };
 
@@ -496,12 +511,47 @@ private:
     {
         spi_bus_config_t buscfg = {};
         buscfg.mosi_io_num      = GPIO_NUM_37;
-        buscfg.miso_io_num      = GPIO_NUM_NC;
+        buscfg.miso_io_num      = GPIO_NUM_35;
+        //buscfg.miso_io_num      = GPIO_NUM_NC;
         buscfg.sclk_io_num      = GPIO_NUM_36;
         buscfg.quadwp_io_num    = GPIO_NUM_NC;
         buscfg.quadhd_io_num    = GPIO_NUM_NC;
         buscfg.max_transfer_sz  = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    }
+
+    void LoadPlacesFromSd()
+    {
+        if (!aw9523_->IsSdCardPresent()) {
+            ESP_LOGW(TAG, "No SD card, place lookup disabled");
+            return;
+        }
+        // The LCD isn't set up yet; keep its CS (GPIO 3) high while the card is clocked.
+        gpio_set_direction(GPIO_NUM_3, GPIO_MODE_OUTPUT);
+        gpio_set_level(GPIO_NUM_3, 1);
+
+        sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+        host.slot         = SPI3_HOST;
+        host.max_freq_khz = 10000;
+        sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+        slot.gpio_cs  = GPIO_NUM_4;
+        slot.host_id  = SPI3_HOST;
+        gpio_set_pull_mode(GPIO_NUM_35, GPIO_PULLUP_ONLY);   // MISO idles high in SD SPI mode
+        vTaskDelay(pdMS_TO_TICKS(250));   // let the card's supply settle
+        esp_vfs_fat_sdmmc_mount_config_t mount = {};
+        mount.format_if_mount_failed = false;
+        mount.max_files              = 2;
+        mount.allocation_unit_size   = 16 * 1024;
+
+        sdmmc_card_t* card = nullptr;
+        esp_err_t err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &card);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
+            return;
+        }
+        sdmmc_card_print_info(stdout, card);
+        PlaceLookup::LoadFromFile("/sdcard/places.bin");
+        esp_vfs_fat_sdcard_unmount("/sdcard", card);   // does not free the SPI bus
     }
 
     void InitializeIli9342Display()
@@ -615,6 +665,7 @@ public:
         I2cDetect();
         InitializeFt6336();
         InitializeSpi();
+        LoadPlacesFromSd();
         InitializeIli9342Display();
         InitializeCamera();
         StartTouchpadTimer();
