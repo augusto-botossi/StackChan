@@ -1,3 +1,12 @@
+## Data sources
+
+Place names for the offline "which town are we in" lookup come from
+[GeoNames](https://www.geonames.org) (`cities15000` and `countryInfo`),
+licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+The data is converted to a compact binary file (`places.bin`) with
+`make_places_bin.py`: names are reduced to ASCII and only name, country and
+coordinates are kept. The file is stored on the device's microSD card and is
+not part of this repository.
 
 ## Build
 
