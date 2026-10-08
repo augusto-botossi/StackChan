@@ -543,10 +543,23 @@ private:
         mount.max_files              = 2;
         mount.allocation_unit_size   = 16 * 1024;
 
+        // The first command to a cold card sometimes fails (CRC errors; about 3 of 6 boots): try again.
+        constexpr int kMountAttempts = 5;
         sdmmc_card_t* card = nullptr;
-        esp_err_t err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &card);
+        esp_err_t err      = ESP_FAIL;
+        for (int attempt = 1; attempt <= kMountAttempts; ++attempt) {
+            err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &card);
+            if (err == ESP_OK) {
+                if (attempt > 1) {
+                    ESP_LOGI(TAG, "SD mounted on attempt %d", attempt);
+                }
+                break;
+            }
+            ESP_LOGW(TAG, "SD mount attempt %d/%d failed: %s", attempt, kMountAttempts, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "SD mount failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "SD mount failed, place lookup disabled");
             return;
         }
         sdmmc_card_print_info(stdout, card);
