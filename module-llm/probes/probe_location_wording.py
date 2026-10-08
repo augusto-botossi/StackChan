@@ -21,6 +21,8 @@ llm task that exists on the unit. Restart the app afterwards. Needs probe_prompt
     adb push probe_location_wording.py /opt/
     python3 -u /opt/probe_location_wording.py > /opt/location_wording.log 2>&1
     python3 -u /opt/probe_location_wording.py --trials 10 --only current,we_are    # more samples, fewer wordings
+    # The town lookup sentences of the firmware (use the town Becky actually names for your position):
+    python3 -u /opt/probe_location_wording.py --only fw_no_town,fw_town_near,fw_town_far --town "Oberursel, Germany" > /opt/location_town.log 2>&1
 
 About 30 minutes with the default 5 trials (7 wordings x 5 questions x 5 trials = 175 answers).
 """
@@ -63,6 +65,16 @@ VARIANTS = {
     "with_town":   lambda q: f"{q} We are near Frankfurt, Germany, at latitude {LAT} and longitude {LON}.",
 }
 
+# What the firmware sends now when places.bin knows the town (hal_offline_agent_callbacks.cpp). The town is
+# filled in by main() from --town ("Name, Country"); within 30 km the sentence says "near", beyond it
+# "the nearest town is".
+TOWN_TEXT = ["Frankfurt, Germany"]
+VARIANTS["fw_town_near"] = lambda q: (f"{q} Current position: latitude is {LAT}, longitude is {LON}. "
+                                      f"We are near {TOWN_TEXT[0]}. Tell the user the town and these coordinates.")
+VARIANTS["fw_town_far"] = lambda q: (f"{q} Current position: latitude is {LAT}, longitude is {LON}. "
+                                     f"The nearest town is {TOWN_TEXT[0]}. Tell the user the town and these coordinates.")
+VARIANTS["fw_no_town"] = VARIANTS["say_it"]   # what the firmware sends without the card (same as say_it)
+
 COORDS = re.compile(r"50\.?\s?2|8\.?\s?64|\b50 degrees|\b8 degrees")
 TOWN = re.compile(r"(?i)frankfurt")
 STOP_CHARS = 110
@@ -73,7 +85,12 @@ def main():
     ap.add_argument("--model", type=str, default="qwen2.5-1.5B-p256-ax630c")
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--only", type=str, default="")
+    ap.add_argument("--town", type=str, default="Frankfurt, Germany",
+                    help='town the lookup would give for these coordinates, "Name, Country"')
     args = ap.parse_args()
+    TOWN_TEXT[0] = args.town
+    global TOWN
+    TOWN = re.compile("(?i)" + re.escape(args.town.split(",")[0].strip()))
     names = [n for n in VARIANTS if not args.only or n in args.only.lower().split(",")]
 
     client = P.Client()
@@ -109,7 +126,7 @@ def main():
             towns += sum(1 for r in rs if r[1])
             cnt += len(rs)
             row += f"{ok:>5}/{len(rs)}"
-        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n == "with_town" else f"{'-':>8}")
+        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far") else f"{'-':>8}")
         print(row)
     print("\nQuestions:")
     for i, q in enumerate(QUESTIONS):
@@ -119,7 +136,7 @@ def main():
     for n in names:
         for qi in range(len(QUESTIONS)):
             for coords, town, ans in results[(n, qi)]:
-                if not coords and not (n == "with_town" and town):
+                if not coords and not (n in ("with_town", "fw_town_near", "fw_town_far") and town):
                     print(f"  [{n}] Q{qi + 1} -> {ans[:90]!r}")
 
     client.send({"request_id": P.new_request_id(), "work_id": work_id, "action": "exit"})
