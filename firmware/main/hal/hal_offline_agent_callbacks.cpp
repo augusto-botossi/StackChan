@@ -183,8 +183,14 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         // "position"/"coordinates" were once missing here and the model invented an address;
         // a bare "where" matched unrelated speech ("...in space where Saturn formed").
         bool wants_location = contains_any({"where am", "where are", "where is", "location", "gps", "position",
-                                            "coordinates", "latitude", "longitude", "altitude", "elevation",
+                                            "coordinate", "latitude", "longitude", "altitude", "elevation",
                                             "how high", "located"});
+        // "Are we near <town>?": the speech recognizer garbles town names ("Fritgris's door"), so the
+        // question words around the name have to trigger the reading, or the model guesses (2026-10-09 test).
+        // "what/which town" and friends are asked when the user does not know the place at all.
+        wants_location = wants_location ||
+                         contains_any({"are we near", "are we close", "are we in ", "are we at ", "what town",
+                                       "which town", "what city", "which city", "what country", "which country"});
         // "height" counts too ("how high we are" was once heard as "tell me or height"), except when it is
         // about Becky herself.
         bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea", "sea level", "height"}) &&
