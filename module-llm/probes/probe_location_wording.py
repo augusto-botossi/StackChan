@@ -75,10 +75,24 @@ VARIANTS["fw_town_far"] = lambda q: (f"{q} Current position: latitude is {LAT}, 
                                      f"The nearest town is {TOWN_TEXT[0]}. Tell the user the town and these coordinates.")
 # Since 2026-10-09 the firmware sends only the town unless the user asks for coordinates/latitude/longitude/GPS.
 VARIANTS["fw_town_only"] = lambda q: f"{q} We are near {TOWN_TEXT[0]}. Tell the user the town."
+# Becky once added "in Bavaria, close to the river ..." (wrong: Friedrichsdorf is in Hesse). Ways to stop the
+# model from adding facts of its own about the town:
+REGION_TEXT = [""]   # set by --region, e.g. "Hesse"
+VARIANTS["fw_town_only_strict"] = lambda q: (f"{q} We are near {TOWN_TEXT[0]}. "
+                                             "Tell the user only the town and country. Do not add other details.")
+VARIANTS["fw_town_region"] = lambda q: (f"{q} We are near {TOWN_TEXT[0].split(',')[0]}, {REGION_TEXT[0]}, "
+                                        f"{TOWN_TEXT[0].split(',')[-1].strip()}. Tell the user the town.")
+VARIANTS["fw_town_region_strict"] = lambda q: (f"{q} We are near {TOWN_TEXT[0].split(',')[0]}, {REGION_TEXT[0]}, "
+                                               f"{TOWN_TEXT[0].split(',')[-1].strip()}. "
+                                               "Tell the user only the town and country. Do not add other details.")
 VARIANTS["fw_no_town"] = VARIANTS["say_it"]   # what the firmware sends without the card (same as say_it)
 
 COORDS = re.compile(r"50\.?\s?2|8\.?\s?64|\b50 degrees|\b8 degrees")
 TOWN = re.compile(r"(?i)frankfurt")
+# Facts the model adds on its own about the place (regions, rivers, neighbours, ...). Wrong ones are the problem.
+EXTRAS = re.compile(r"(?i)bavaria|bayern|hesse|hessen|river|state of|region|county|district|province|"
+                    r"close to|north of|south of|east of|west of|located|known for|capital|population|"
+                    r"suburb|outskirts|famous|mountain|lake|forest")
 STOP_CHARS = 110
 
 
@@ -87,10 +101,15 @@ def main():
     ap.add_argument("--model", type=str, default="qwen2.5-1.5B-p256-ax630c")
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--only", type=str, default="")
+    ap.add_argument("--region", type=str, default="Hesse",
+                    help="region of the town, for the fw_town_region variants")
+    ap.add_argument("--chars", type=int, default=220,
+                    help="stop each answer after this many characters (110 cut off the extras)")
     ap.add_argument("--town", type=str, default="Frankfurt, Germany",
                     help='town the lookup would give for these coordinates, "Name, Country"')
     args = ap.parse_args()
     TOWN_TEXT[0] = args.town
+    REGION_TEXT[0] = args.region
     global TOWN
     TOWN = re.compile("(?i)" + re.escape(args.town.split(",")[0].strip()))
     names = [n for n in VARIANTS if not args.only or n in args.only.lower().split(",")]
@@ -108,7 +127,7 @@ def main():
         for qi, q in enumerate(QUESTIONS):
             for n in names:       # interleaved, so a slow drift cannot favour one wording
                 prompt = VARIANTS[n](q)
-                ans, _fin, _pau, _first = P.run_trial(client, work_id, prompt, STOP_CHARS)
+                ans, _fin, _pau, _first = P.run_trial(client, work_id, prompt, args.chars)
                 results[(n, qi)].append((bool(COORDS.search(ans)), bool(TOWN.search(ans)), ans))
         print(f"   trial {trial}/{args.trials} done", flush=True)
 
@@ -128,17 +147,33 @@ def main():
             towns += sum(1 for r in rs if r[1])
             cnt += len(rs)
             row += f"{ok:>5}/{len(rs)}"
-        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only") else f"{'-':>8}")
+        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only", "fw_town_only_strict", "fw_town_region", "fw_town_region_strict") else f"{'-':>8}")
         print(row)
     print("\nQuestions:")
     for i, q in enumerate(QUESTIONS):
         print(f"  Q{i + 1}: {q.strip()}")
 
+    print("\nANSWERS THAT ADD FACTS OF THEIR OWN (region, river, neighbours ...; the region we gave does not count)")
+    own_region = REGION_TEXT[0].lower()
+    for n in names:
+        bad = []
+        for qi in range(len(QUESTIONS)):
+            for _c, _t, ans in results[(n, qi)]:
+                hits = [m.group(0) for m in EXTRAS.finditer(ans)]
+                if "region" in n and own_region:
+                    hits = [h for h in hits if h.lower() != own_region]
+                if hits:
+                    bad.append((qi, hits, ans))
+        total = sum(len(results[(n, qi)]) for qi in range(len(QUESTIONS)))
+        print(f"  {n:<24} {len(bad)}/{total} answers with extras")
+        for qi, hits, ans in bad[:6]:
+            print(f"      Q{qi + 1} {hits} -> {ans[:160]!r}")
+
     print("\nANSWERS WITHOUT THE COORDINATES (first characters):")
     for n in names:
         for qi in range(len(QUESTIONS)):
             for coords, town, ans in results[(n, qi)]:
-                if not coords and not (n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only") and town):
+                if not coords and not (n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only", "fw_town_only_strict", "fw_town_region", "fw_town_region_strict") and town):
                     print(f"  [{n}] Q{qi + 1} -> {ans[:90]!r}")
 
     client.send({"request_id": P.new_request_id(), "work_id": work_id, "action": "exit"})
