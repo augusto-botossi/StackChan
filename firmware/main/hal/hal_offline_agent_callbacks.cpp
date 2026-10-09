@@ -187,10 +187,12 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                                             "how high", "located"});
         // "height" counts too ("how high we are" was once heard as "tell me or height"), except when it is
         // about Becky herself.
-        bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea", "height"}) &&
+        bool wants_altitude = contains_any({"altitude", "how high", "elevation", "above sea", "sea level", "height"}) &&
                               !contains_any({"your height", "how tall"});
         wants_location = wants_location || wants_altitude;
         bool wants_speed = contains_any({"speed", "how fast", "moving"});
+        // Only these bring the numbers; "where are we?" gets the town name alone (when places.bin is loaded).
+        bool wants_coords = contains_any({"coordinate", "latitude", "longitude", "gps"});
 
         // ---- environment (only the readings that were asked for) ----
         bool wants_weather = contains_any({"weather", "conditions"});
@@ -205,40 +207,49 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
         if (wants_location && GetHAL().getGps()) {
             auto fix = GetHAL().getGps()->getLastFix();
             if (fix.valid) {
-                // Spelled-out words: the dense "latitude 50.257415, longitude 8.642969, altitude
-                // 201.4m" form was ignored by the model even though it was attached. 4 decimals
-                // (~11 m) is plenty for speech.
-                std::string pos = fmt::format("latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}",
-                                              std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
-                                              std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west");
-                if (wants_speed) {
-                    pos += fmt::format(", speed is {:.1f} kilometers per hour", fix.speedKmh);
-                }
-                augmented += " Current position: " + pos + ".";
-
                 // Offline town lookup (places.bin, loaded from the SD card at boot). If the card or file
-                // was missing, Loaded() is false and the sentence stays exactly as before.
+                // was missing, Loaded() is false and Becky falls back to the coordinates.
                 bool have_town = false;
                 PlaceResult place;
                 if (PlaceLookup::Loaded() && PlaceLookup::Nearest(fix.latitude, fix.longitude, place)) {
                     have_town = true;
+                }
+                // With a town, the coordinates are only attached when the user asked for them ("what are our
+                // coordinates?"): the town sounds more natural and saves about 35 tokens.
+                const bool give_coords = wants_coords || !have_town;
+
+                if (give_coords) {
+                    // Spelled-out words: the dense "latitude 50.257415, longitude 8.642969, altitude
+                    // 201.4m" form was ignored by the model even though it was attached. 4 decimals
+                    // (~11 m) is plenty for speech.
+                    augmented += fmt::format(
+                        " Current position: latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}.",
+                        std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
+                        std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west");
+                }
+                if (have_town) {
                     if (place.distance_km <= 30.0f) {
                         augmented += fmt::format(" We are near {}, {}.", place.name, place.country);
                     } else {
                         augmented += fmt::format(" The nearest town is {}, {}.", place.name, place.country);
                     }
                 }
-                if (!wants_altitude) {
-                    // Probe_location_wording: without this instruction the model skipped the coordinates in
-                    // 5 of 25 answers (2 of 5 for "how about our current location"); with it, 0 of 25.
-                    augmented += have_town ? " Tell the user the town and these coordinates."
-                                           : " Tell the user these coordinates.";
+                if (wants_speed) {
+                    augmented += fmt::format(" Our speed is {:.1f} kilometers per hour.", fix.speedKmh);
                 }
                 if (wants_altitude) {
                     // A separate sentence that says what "height" means here: "how high we are" was once
                     // answered as if it were about Becky's own height.
                     augmented += fmt::format(" Our altitude, our height above sea level, is {:.0f} meters.",
                                              fix.altitudeM);
+                }
+                // Probe_location_wording: without an instruction the model skipped the coordinates in 5 of 25
+                // answers; with it, 0 of 25. Not for altitude or speed questions (they answer themselves).
+                if (wants_coords) {
+                    augmented += have_town ? " Tell the user the town and these coordinates."
+                                           : " Tell the user these coordinates.";
+                } else if (!wants_altitude && !wants_speed) {
+                    augmented += have_town ? " Tell the user the town." : " Tell the user these coordinates.";
                 }
             } else {
                 augmented += " No GPS fix is currently available.";
