@@ -246,10 +246,14 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                 // Probe_location_wording: without an instruction the model skipped the coordinates in 5 of 25
                 // answers; with it, 0 of 25. Not for altitude or speed questions (they answer themselves).
                 if (wants_coords) {
-                    augmented += have_town ? " Tell the user the town and these coordinates."
+                    augmented += have_town ? " Tell the user only the town and these coordinates. Do not add other details."
                                            : " Tell the user these coordinates.";
                 } else if (!wants_altitude && !wants_speed) {
-                    augmented += have_town ? " Tell the user the town." : " Tell the user these coordinates.";
+                    // probe_location_wording (25 answers): "Tell the user the town." alone let the model add
+                    // wrong facts in 6 (Friedrichsdorf "in Brandenburg, close to Berlin"; with the real region
+                    // given, 10 of 25); "only the town and country. Do not add other details." gave 0 of 25.
+                    augmented += have_town ? " Tell the user only the town and country. Do not add other details."
+                                           : " Tell the user these coordinates.";
                 }
             } else {
                 augmented += " No GPS fix is currently available.";
