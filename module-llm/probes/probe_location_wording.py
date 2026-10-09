@@ -80,6 +80,9 @@ VARIANTS["fw_town_only"] = lambda q: f"{q} We are near {TOWN_TEXT[0]}. Tell the 
 REGION_TEXT = [""]   # set by --region, e.g. "Hesse"
 VARIANTS["fw_town_only_strict"] = lambda q: (f"{q} We are near {TOWN_TEXT[0]}. "
                                              "Tell the user only the town and country. Do not add other details.")
+VARIANTS["fw_town_near_strict"] = lambda q: (f"{q} Current position: latitude is {LAT}, longitude is {LON}. "
+                                             f"We are near {TOWN_TEXT[0]}. "
+                                             "Tell the user only the town and these coordinates. Do not add other details.")
 VARIANTS["fw_town_region"] = lambda q: (f"{q} We are near {TOWN_TEXT[0].split(',')[0]}, {REGION_TEXT[0]}, "
                                         f"{TOWN_TEXT[0].split(',')[-1].strip()}. Tell the user the town.")
 VARIANTS["fw_town_region_strict"] = lambda q: (f"{q} We are near {TOWN_TEXT[0].split(',')[0]}, {REGION_TEXT[0]}, "
@@ -147,7 +150,7 @@ def main():
             towns += sum(1 for r in rs if r[1])
             cnt += len(rs)
             row += f"{ok:>5}/{len(rs)}"
-        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only", "fw_town_only_strict", "fw_town_region", "fw_town_region_strict") else f"{'-':>8}")
+        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only", "fw_town_only_strict", "fw_town_near_strict", "fw_town_region", "fw_town_region_strict") else f"{'-':>8}")
         print(row)
     print("\nQuestions:")
     for i, q in enumerate(QUESTIONS):
