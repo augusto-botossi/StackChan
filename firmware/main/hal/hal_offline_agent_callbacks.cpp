@@ -228,10 +228,13 @@ void Hal::registerOfflineAgentCallbacks(OfflineAgentModule* agent)
                     // Spelled-out words: the dense "latitude 50.257415, longitude 8.642969, altitude
                     // 201.4m" form was ignored by the model even though it was attached. 4 decimals
                     // (~11 m) is plenty for speech.
+                    const double abs_lat   = std::fabs(fix.latitude);
+                    const double abs_lon   = std::fabs(fix.longitude);
+                    const char* lat_suffix = fix.latitude >= 0 ? "north" : "south";
+                    const char* lon_suffix = fix.longitude >= 0 ? "east" : "west";
                     augmented += fmt::format(
                         " Current position: latitude is {:.4f} degrees {}, longitude is {:.4f} degrees {}.",
-                        std::fabs(fix.latitude), fix.latitude >= 0 ? "north" : "south",
-                        std::fabs(fix.longitude), fix.longitude >= 0 ? "east" : "west");
+                        abs_lat, lat_suffix, abs_lon, lon_suffix);
                 }
                 if (have_town) {
                     if (place.distance_km <= 30.0f) {
