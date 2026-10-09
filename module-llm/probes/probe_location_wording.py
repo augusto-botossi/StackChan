@@ -115,7 +115,7 @@ def main():
     names = [n for n in VARIANTS if not args.only or n in args.only.lower().split(",")]
 
     client = P.Client()
-    P.cleanup(client, ["llm"])
+    P.cleanup(client, ["llm", "melotts"])   # melotts too: a speech unit left by the app would read every answer aloud
     P.SETUP_DATA = {**P.SETUP_DATA, "model": args.model, "prompt": SYSTEM_PROMPT}
     work_id = P.setup_and_wait(client)
     print(f"Model under test: {args.model}; {len(names)} wordings x {len(QUESTIONS)} questions x "
