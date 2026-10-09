@@ -22,7 +22,7 @@ llm task that exists on the unit. Restart the app afterwards. Needs probe_prompt
     python3 -u /opt/probe_location_wording.py > /opt/location_wording.log 2>&1
     python3 -u /opt/probe_location_wording.py --trials 10 --only current,we_are    # more samples, fewer wordings
     # The town lookup sentences of the firmware (use the town Becky actually names for your position):
-    python3 -u /opt/probe_location_wording.py --only fw_no_town,fw_town_near,fw_town_far --town "Oberursel, Germany" > /opt/location_town.log 2>&1
+    python3 -u /opt/probe_location_wording.py --only fw_town_only,fw_town_near --town "Oberursel, Germany" > /opt/location_town.log 2>&1
 
 About 30 minutes with the default 5 trials (7 wordings x 5 questions x 5 trials = 175 answers).
 """
@@ -73,6 +73,8 @@ VARIANTS["fw_town_near"] = lambda q: (f"{q} Current position: latitude is {LAT},
                                       f"We are near {TOWN_TEXT[0]}. Tell the user the town and these coordinates.")
 VARIANTS["fw_town_far"] = lambda q: (f"{q} Current position: latitude is {LAT}, longitude is {LON}. "
                                      f"The nearest town is {TOWN_TEXT[0]}. Tell the user the town and these coordinates.")
+# Since 2026-10-09 the firmware sends only the town unless the user asks for coordinates/latitude/longitude/GPS.
+VARIANTS["fw_town_only"] = lambda q: f"{q} We are near {TOWN_TEXT[0]}. Tell the user the town."
 VARIANTS["fw_no_town"] = VARIANTS["say_it"]   # what the firmware sends without the card (same as say_it)
 
 COORDS = re.compile(r"50\.?\s?2|8\.?\s?64|\b50 degrees|\b8 degrees")
@@ -126,7 +128,7 @@ def main():
             towns += sum(1 for r in rs if r[1])
             cnt += len(rs)
             row += f"{ok:>5}/{len(rs)}"
-        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far") else f"{'-':>8}")
+        row += f"{tot:>6}/{cnt:<4}" + (f"{towns:>7}/{cnt}" if n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only") else f"{'-':>8}")
         print(row)
     print("\nQuestions:")
     for i, q in enumerate(QUESTIONS):
@@ -136,7 +138,7 @@ def main():
     for n in names:
         for qi in range(len(QUESTIONS)):
             for coords, town, ans in results[(n, qi)]:
-                if not coords and not (n in ("with_town", "fw_town_near", "fw_town_far") and town):
+                if not coords and not (n in ("with_town", "fw_town_near", "fw_town_far", "fw_town_only") and town):
                     print(f"  [{n}] Q{qi + 1} -> {ans[:90]!r}")
 
     client.send({"request_id": P.new_request_id(), "work_id": work_id, "action": "exit"})
