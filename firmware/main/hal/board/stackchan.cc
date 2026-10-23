@@ -164,6 +164,21 @@ public:
         return true;
     }
 
+    // Non-fatal variant used by the periodic poll: one register read, no ESP_ERROR_CHECK.
+    // Returns false when the I2C read timed out (the caller keeps the previous state).
+    bool TryReadPowerState(bool& external_power, bool& discharging)
+    {
+        uint8_t power_status = 0;
+        if (TryReadRegs(0x01, &power_status, 1, 100) != ESP_OK) {
+            return false;
+        }
+        const uint8_t current_direction = (power_status & 0b01100000) >> 5;
+        const bool is_charging_done     = (power_status & 0b00000111) == 0b00000100;
+        external_power                  = current_direction != 2 || is_charging_done;
+        discharging                     = current_direction == 2;
+        return true;
+    }
+
     bool IsExternalPowerConnected()
     {
         const uint8_t power_status      = ReadReg(0x01);
@@ -369,7 +384,14 @@ private:
         }
         last_power_state_check_ms_ = now_ms;
 
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        bool external_power = false;
+        bool discharging    = false;
+        if (!pmic_->TryReadPowerState(external_power, discharging)) {
+            // An I2C timeout (seen while Wi-Fi/TLS is busy) must not reboot the device.
+            ESP_LOGW(TAG, "Power state read timed out, keeping previous state");
+            return;
+        }
+        UpdatePowerSaveEnabled(external_power, discharging);
     }
 
     void InitializePowerSaveTimer()
