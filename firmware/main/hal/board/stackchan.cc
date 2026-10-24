@@ -565,11 +565,12 @@ private:
         mount.max_files              = 2;
         mount.allocation_unit_size   = 16 * 1024;
 
-        // The first command to a cold card sometimes fails (CRC errors; about 3 of 6 boots): try again.
-        // Mount failures are random (CRC / invalid response), even after reseating the card, so allow more
-        // attempts with a growing rest in between, re-assert the MISO pull-up each time and log the idle MISO level
-        // (CS high): ~1 = line floats/pulled up as it should, 0 = something holds it low.
-        constexpr int kMountAttempts = 8;
+        // The card is slow to answer right after a flash: the first boot after flashing failed 6 attempts (CRC / invalid
+        // response) and mounted on attempt 7, about 5.5 s after power-up; later resets mount on attempt 1. So keep
+        // trying with a growing rest (350, 500, ... capped at 1000 ms; about 10 s in the worst case). The MISO pull-up is
+        // re-asserted before every attempt and the idle MISO level is logged (1 = pulled up as expected, 0 = something
+        // holds the line low).
+        constexpr int kMountAttempts = 12;
         sdmmc_card_t* card = nullptr;
         esp_err_t err      = ESP_FAIL;
         for (int attempt = 1; attempt <= kMountAttempts; ++attempt) {
@@ -583,7 +584,7 @@ private:
                 break;
             }
             ESP_LOGW(TAG, "SD mount attempt %d/%d failed: %s", attempt, kMountAttempts, esp_err_to_name(err));
-            vTaskDelay(pdMS_TO_TICKS(200 + 150 * attempt));   // 350, 500, 650 ... ms
+            vTaskDelay(pdMS_TO_TICKS(std::min(200 + 150 * attempt, 1000)));
         }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "SD mount failed, place lookup disabled");
