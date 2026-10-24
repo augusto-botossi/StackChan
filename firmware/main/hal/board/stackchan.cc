@@ -566,10 +566,15 @@ private:
         mount.allocation_unit_size   = 16 * 1024;
 
         // The first command to a cold card sometimes fails (CRC errors; about 3 of 6 boots): try again.
-        constexpr int kMountAttempts = 5;
+        // Mount failures are random (CRC / invalid response), even after reseating the card, so allow more
+        // attempts with a growing rest in between, re-assert the MISO pull-up each time and log the idle MISO level
+        // (CS high): ~1 = line floats/pulled up as it should, 0 = something holds it low.
+        constexpr int kMountAttempts = 8;
         sdmmc_card_t* card = nullptr;
         esp_err_t err      = ESP_FAIL;
         for (int attempt = 1; attempt <= kMountAttempts; ++attempt) {
+            gpio_set_pull_mode(GPIO_NUM_35, GPIO_PULLUP_ONLY);
+            ESP_LOGI(TAG, "SD attempt %d: MISO(GPIO35) idle level=%d", attempt, gpio_get_level(GPIO_NUM_35));
             err = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot, &mount, &card);
             if (err == ESP_OK) {
                 if (attempt > 1) {
@@ -578,7 +583,7 @@ private:
                 break;
             }
             ESP_LOGW(TAG, "SD mount attempt %d/%d failed: %s", attempt, kMountAttempts, esp_err_to_name(err));
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(200 + 150 * attempt));   // 350, 500, 650 ... ms
         }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "SD mount failed, place lookup disabled");
